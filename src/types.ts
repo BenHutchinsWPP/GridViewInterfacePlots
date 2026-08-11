@@ -1,9 +1,8 @@
 // src/types.ts
 //
 // Core model types. `Query` is the single source of truth the whole UI
-// renders from (plan.md's "Architecture recap": "The whole UI is
-// render(query) against one frozen query object.") -- construct it once per
-// interaction and Object.freeze it; treat every field as immutable.
+// renders from -- construct it once per interaction and Object.freeze it;
+// treat every field as immutable.
 
 /**
  * Context filters over the 8,760-hour calendar. `null` means "no
@@ -19,10 +18,10 @@ export interface Filters {
   readonly tou: Set<string> | null; // e.g. 'OnPeak' | 'OffPeak' -- read from file data, never derived (footgun 17)
 }
 
-export type BoxDim = 'case' | 'month' | 'hourOfDay' | 'dayOfWeek' | 'season' | 'area';
+export type BoxDim = 'case' | 'interface' | 'month' | 'hourOfDay' | 'dayOfWeek' | 'season';
 
-/** 'grid' shows the 2x2 layout; 1-4 focuses a single pane (plan.md GUI
- * decision 1: keys `1`-`4` focus a pane, `Esc` returns to the grid).
+/** 'grid' shows the 2x2 layout; 1-4 focuses a single pane (keys `1`-`4` focus
+ * a pane, `Esc` returns to the grid).
  *
  * Deliberately NOT part of Query: focus is pure layout, it changes nothing
  * the kernels compute, and shell.ts owns it. Panes resize through the
@@ -33,112 +32,76 @@ export type PaneView = 'grid' | 1 | 2 | 3 | 4;
 /**
  * The single query object render(query) is a pure function of. Build a new
  * object and Object.freeze it rather than mutating fields in place.
+ *
+ * A drawn series is one (case, interface) pair. The quantity -- power flow,
+ * congestion cost -- is a property of the CASE, because one export file is one
+ * quantity for every interface it monitors (D13); it is not a third axis.
  */
-export type Selection = Readonly<{ kind: 'area' | 'grouping'; name: string }>;
-
 export interface Query {
   readonly cases: readonly string[];
-  /** One or more metrics. Every drawn series is one (case, selection, metric)
-   * of the cross product, so this multiplies with `selections`. */
-  readonly metrics: readonly string[];
-  readonly selections: readonly Selection[];
+  /** One or more monitored interfaces. Every drawn series is one
+   * (case, interface) of the cross product. */
+  readonly interfaces: readonly string[];
   readonly filters: Filters;
   readonly boxDim: BoxDim;
 }
 
-/** Column classification, mirrors data/aggregation-rules.json exactly --
- * see that file's `contract` string for the resolution rule this type
- * supports. Never re-derive it; branch on `series`/`temporal`/`weight`. */
-export type ColumnClass = 'EXTENSIVE' | 'INTENSIVE' | 'CAPACITY';
-export type SeriesRule = 'SUM' | 'WEIGHTED_MEAN' | 'MEAN';
+/** How a quantity behaves when hours are combined. Mirrors
+ * data/quantity-rules.json exactly -- never re-derive it. */
+export type QuantityClass = 'EXTENSIVE' | 'INTENSIVE' | 'RATE';
+export type TemporalRule = 'SUM' | 'MEAN';
 
-/** One entry of data/aggregation-rules.json's `columns` array. */
-export interface ColumnRule {
-  readonly header: string;
-  readonly canonical: string;
+/** One entry of data/quantity-rules.json's `units` array. */
+export interface UnitRule {
   readonly unit: string;
-  readonly class: ColumnClass;
-  /** How to build the per-hour series when combining areas into a grouping. */
-  readonly series: SeriesRule;
-  /** How to combine hours into a period total/average. SUM means a period
-   * total is meaningful (e.g. MWh); MEAN means it is not (MW summed over
-   * hours is not MWh). */
-  readonly temporal: SeriesRule;
-  /** Weight column for WEIGHTED_MEAN, e.g. 'Load (MWh)'. */
-  readonly weight?: string;
-  /** Tried when sum(weight) === 0 over the filtered hours. */
-  readonly fallbackWeight?: string;
-  /** True for columns that are themselves a weight another column depends on. */
-  readonly isWeight?: boolean;
+  readonly class: QuantityClass;
   /**
-   * A CALCULATED column: no source column carries it. Its cube plane is filled
-   * at ingest from the two named operands per area, and it is present only
-   * when both are. `minuend`/`subtrahend` are the left and right operand of
-   * whichever `op` applies.
-   *
-   * `sub` (the default) is only sound because both operands are same-unit
-   * EXTENSIVE, so `Σ_a(x-y) == Σ_a x - Σ_a y` and it does not matter whether
-   * the subtraction happens before or after the area collapse.
-   *
-   * `div` does NOT commute with the collapse -- `Σ(a/b) != Σa/Σb` -- so a
-   * per-area ratio is only ever a per-area answer, and the column MUST carry
-   * `series: 'WEIGHTED_MEAN'` with `weight` set to the DENOMINATOR. That is
-   * what puts the ratio of sums back: `Σ((a/b)·b)/Σb == Σa/Σb`. A `div` rule
-   * with any other series (or weight) is a plausible wrong number, so
-   * test_kernels.mjs asserts the pairing rather than trusting the table.
+   * How to combine HOURS into a period figure. SUM means a period total is
+   * meaningful ($ of congestion over a month is a real number); MEAN means it
+   * is not (MW summed over hours is not MW, and is not MWh either unless the
+   * hours are contiguous -- which a filtered selection is not).
    */
-  readonly derived?: {
-    readonly minuend: string;
-    readonly subtrahend: string;
-    readonly op?: 'sub' | 'div';
-  };
-  /**
-   * The rule for this column was inferred from its name and units rather than
-   * confirmed against GridView's own definition. Nothing branches on it: it
-   * marks the rows to re-check against a real export, and which 12 rows carry
-   * it is not currently self-consistent (`Avg LMP Weighted by Load` has it,
-   * `by Gen` does not; five of the six A.S. prices have it).
-   */
-  readonly provisional?: boolean;
-  /** All-zero in every hour of every case seen so far -- valid data, not a load error. */
-  readonly degenerate?: boolean;
-  /** Mostly zero/absent. */
-  readonly sparse?: boolean;
-  /** Summing this across areas double-counts (e.g. a flow shared by both sides of a tie). */
-  readonly intraGroupHazard?: boolean;
+  readonly temporal: TemporalRule;
+  /** Shown next to the total in the stats table. */
+  readonly note?: string;
 }
 
 /**
- * One case's fully-ingested data. `cube` is a single flat Float32Array
- * indexed as:
+ * One case: one GridView interface export file.
  *
- *   cube[(area * numMetrics + metric) * 8760 + hour]
+ * `cube` is a single flat Float32Array indexed as:
  *
- * where `area` and `metric` are indices into `areas`/`metrics` -- Date,
- * Hour and Name are index arithmetic, never stored as strings in the cube.
+ *   cube[iface * 8760 + hour]
+ *
+ * where `iface` is an index into `interfaces` -- Date and Hour are index
+ * arithmetic, never stored as strings in the cube.
  */
 export interface CaseData {
+  /** The file name without its extension, e.g. `01_PF`. */
   name: string;
   cube: Float32Array;
-  areas: string[];
-  metrics: string[];
-  /** Presence bitmap, one byte per (area, metric) pair at index
-   * `area * numMetrics + metric`: 1 = that plane has real data in `cube`,
-   * 0 = it is NaN-filled because the source file lacked the column for
-   * that area. Every kernel must consult this before reading the cube --
-   * NaN poisons Welford, min/max, and duration-curve sort silently
-   * (footgun 21). */
+  /** The cube's interface axis: the retained columns, in cube-index order. */
+  interfaces: string[];
+  /** Presence bitmap, one byte per interface: 1 = this file's header carried
+   * it and the plane holds real data, 0 = it is NaN-filled because this
+   * export does not monitor that path. Every kernel must consult this before
+   * reading the cube -- NaN poisons Welford, min/max, and the duration-curve
+   * sort silently (footgun 21). */
   presence: Uint8Array;
   /** Per-hour TOU code, length 8760, indexes into calendar.ts's
    * TOU_LABELS. Read from the file's TOU column at ingest -- never
    * recomputed (footgun 17). */
   tou: Uint8Array;
-  /** Full column list present in the source CSV, independent of what was
-   * retained -- lets Save/Load and the picker distinguish "never existed
-   * in this study" from "existed but wasn't kept". */
+  /** Every interface the source CSV carried, retained or not -- lets Save/Load
+   * and the picker distinguish "never monitored in this run" from "monitored
+   * but not kept". */
   sourceColumns: string[];
-  /** Calendar year this case's 8,760 hours belong to -- selects which
-   * buildCalendar(year) to use. Feb 29 is dropped at ingest regardless of
-   * year (D4), so every case is exactly 8,760 hours. */
+  /** Calendar year this case's 8,760 hours belong to. Feb 29 is dropped at
+   * ingest (D4), so every case is exactly 8,760 hours. */
   year: number;
+  /** What this file measures, verbatim from its title line, e.g.
+   * `Power Flow (MW)`. Empty when the title line could not be read. */
+  quantity: string;
+  /** The parenthesised unit of `quantity`, e.g. `MW`. Empty when unknown. */
+  unit: string;
 }

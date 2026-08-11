@@ -5,12 +5,11 @@
 // The unit of work is a BYTE RANGE, not a case (D10): a single dropped file
 // must use every core, so one dropped file and ten dropped files feed the
 // same pool. Blocks are position-independent because block.c derives each
-// row's area and hour from the row's own Date/Hour/Name fields, so a worker
-// needs its bytes and nothing else.
+// row's hour from the row's own Date/Hour fields, so a worker needs its bytes
+// and nothing else.
 //
 // Per-instance memory is a function of BLOCK size, never case size
-// (footgun 22): 12 MiB input window + 8.8 MB slab, so eight workers cost
-// ~256 MiB of scratch instead of 1,280 MiB.
+// (footgun 22): a 12 MiB input window + an 8 MiB slab.
 //
 // All the real work is in block.ts, which test_ingest.mjs drives directly.
 // This file is only: read the bytes, widen to whole rows, transfer back.
@@ -23,16 +22,14 @@ import {
   type ParserExports,
 } from './block';
 
-/** Bytes read past the requested end to complete the final row. Rows average
- * 364 B in the real export, so this is ~180 rows of slack; a longer row is
- * handled by re-reading wider rather than by truncating. */
+/** Bytes read past the requested end to complete the final row. An interface
+ * export's rows run ~1.5 KB at 167 columns, so this is ~40 rows of slack; a
+ * longer row is handled by re-reading wider rather than by truncating. */
 const TAIL_BYTES = 64 * 1024;
 
 export interface InitMessage {
   kind: 'init';
   module: WebAssembly.Module;
-  /** FNV-1a of every area name, in cube-area-index order. */
-  areaHashes: Uint32Array;
 }
 
 export interface BlockMessage {
@@ -111,7 +108,7 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
   const message = event.data;
   try {
     if (message.kind === 'init') {
-      parser = await instantiateParser(message.module, message.areaHashes);
+      parser = await instantiateParser(message.module);
       const ready: WorkerReady = { kind: 'ready' };
       (self as unknown as Worker).postMessage(ready);
       return;
@@ -126,11 +123,7 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       caseIndex: message.caseIndex,
       ...payload,
     };
-    (self as unknown as Worker).postMessage(result, [
-      result.data.buffer,
-      result.tou.buffer,
-      result.areaSeen.buffer,
-    ]);
+    (self as unknown as Worker).postMessage(result, [result.data.buffer, result.tou.buffer]);
   } catch (error) {
     const failure: WorkerError = {
       kind: 'error',

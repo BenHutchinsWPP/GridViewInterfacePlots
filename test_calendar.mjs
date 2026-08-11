@@ -1,181 +1,237 @@
-// test_calendar.mjs
+// test_calendar.mjs — the 8,760-hour calendar, the keep-mask, the status line.
 //
-// Plain node, assert-based, no test framework (CLAUDE.md hard rule 6).
-// Exercises the real src/*.ts modules directly -- not a reimplementation --
-// via Node's built-in TypeScript stripping (Node >=22.6, no flag needed on
-// Node 24). test_loader.mjs supplies the two things Node does not: the
-// extensionless-import hook, and the area axis and grouping mapping that
-// groupings.ts no longer ships with the build.
+// Plain node, assert-based, no test framework. Exits non-zero on any failure.
 //
-// Run: node test_calendar.mjs
+// The calendar is pure index arithmetic and never touches a Date object
+// (footgun 3): one `new Date(str)` shifts rows by a day in half the world's
+// timezones. So the day-of-week has to be checked against dates whose weekday
+// is known independently, not against a Date the same bug would produce.
+//
+// The mask is where a filter becomes a selection, and TOU is the one
+// dimension in it that is FILE DATA rather than a formula (footgun 17).
+//
+// Run:  node test_calendar.mjs
 
 import assert from 'node:assert/strict';
-
-import rulesData from './data/aggregation-rules.json' with { type: 'json' };
-
 import './test_loader.mjs';
 
-const { buildCalendar, buildMask, getMonth, getDayOfMonth, getDayOfWeek, HOURS_PER_YEAR } = await import(
-  './src/calendar.ts'
-);
-const { areasIn } = await import('./src/groupings.ts');
 const {
-  ruleFor,
-  groupOf,
-  metricGroups,
-  requiredInputs,
-  defaultSelection,
-  scaleOf,
-  scalesOf,
-  DEFAULT_METRICS,
-  CALCULATED_GROUP,
-} = await import('./src/rules.ts');
+  buildCalendar,
+  buildMask,
+  DAY_NAMES,
+  getDayOfMonth,
+  getDayOfWeek,
+  getHourOfDay,
+  getMonth,
+  getSeason,
+  HOURS_PER_YEAR,
+  MONTH_NAMES,
+  SEASON_NAMES,
+  TOU_LABELS,
+} = await import('./src/calendar.ts');
+const { statusSentence } = await import('./src/ui/shell.ts');
 
-let passed = 0;
-function check(label, fn) {
-  fn();
-  passed++;
+const HOURS = HOURS_PER_YEAR;
+let checks = 0;
+function ok(label) {
+  checks++;
   console.log(`ok - ${label}`);
 }
 
-// --- 1. 8,760 entries, non-leap month histogram -----------------------
+const NO_FILTERS = {
+  months: null,
+  hoursOfDay: null,
+  daysOfWeek: null,
+  seasons: null,
+  tou: null,
+};
 
-check('calendar has exactly 8,760 entries', () => {
+// ---------------------------------------------------------------- shape
+
+{
   const calendar = buildCalendar(2035);
-  assert.equal(calendar.length, HOURS_PER_YEAR);
-  assert.equal(calendar.length, 8760);
-});
+  assert.equal(calendar.length, HOURS, 'a case is exactly 8,760 hours (D4)');
+  assert.equal(buildCalendar(2035), calendar, 'calendars are memoized per year');
+  assert.notEqual(buildCalendar(2036), calendar, 'a different year is a different calendar');
 
-check('month histogram matches non-leap month lengths x 24', () => {
-  const calendar = buildCalendar(2035);
-  const histogram = new Array(13).fill(0); // 1-indexed, [0] unused
-  for (let h = 0; h < calendar.length; h++) {
-    histogram[getMonth(calendar[h])]++;
+  // Every hour of the year, walked independently of the packed entry.
+  const LENGTHS = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  let hour = 0;
+  for (let month = 1; month <= 12; month++) {
+    for (let day = 1; day <= LENGTHS[month - 1]; day++) {
+      for (let he = 1; he <= 24; he++) {
+        const entry = calendar[hour++];
+        assert.equal(getMonth(entry), month);
+        assert.equal(getDayOfMonth(entry), day);
+        assert.equal(getHourOfDay(entry), he);
+      }
+    }
   }
-  const expected = [744, 672, 744, 720, 744, 720, 744, 744, 720, 744, 720, 744];
-  assert.deepEqual(histogram.slice(1), expected);
-});
+  assert.equal(hour, HOURS, 'the walk covers the year exactly');
+  ok('every hour decodes to its own month, day and hour-ending — 8,760 of them');
 
-// --- 2. Day-of-week for known dates ------------------------------------
-//
-// Anchors independently verified against Python's datetime module (a
-// different implementation from anything in this repo, per footgun 3's
-// warning not to trust a single oracle):
-//   >>> datetime.date(2035, 1, 1).strftime('%A')  -> 'Monday'
-//   >>> datetime.date(2034, 7, 4).strftime('%A')  -> 'Tuesday'
-// calendar.ts's dayOfWeek() uses 0=Monday .. 6=Sunday.
-
-function dayOfWeekOf(calendar, month, day) {
-  for (let h = 0; h < calendar.length; h++) {
-    const entry = calendar[h];
-    if (getMonth(entry) === month && getDayOfMonth(entry) === day) return getDayOfWeek(entry);
-  }
-  throw new Error(`month ${month} day ${day} not found`);
+  // A leap year uses the same 8,760 hours: Feb 29 is dropped at ingest, so
+  // Mar 1 sits at the same index in 2035 and 2036 and the cases overlay.
+  const leap = buildCalendar(2036);
+  const mar1 = (31 + 28) * 24;
+  assert.equal(getMonth(leap[mar1]), 3);
+  assert.equal(getDayOfMonth(leap[mar1]), 1);
+  ok('a leap year is the same 8,760 hours — Feb 29 never enters the calendar');
 }
 
-check('2035-01-01 is a Monday', () => {
-  assert.equal(dayOfWeekOf(buildCalendar(2035), 1, 1), 0);
-});
+// ---------------------------------------------------------------- weekday
 
-check('2034-07-04 is a Tuesday', () => {
-  assert.equal(dayOfWeekOf(buildCalendar(2034), 7, 4), 1);
-});
-
-// --- 3. Mask count, computed by hand -------------------------------------
-//
-// "August only, weekdays only, hours 7-22" for calendar year 2035.
-// August 2035 has 31 days; August 1, 2035 is a Wednesday (independently
-// confirmed via Python's datetime, not by re-running calendar.ts).
-// Walking Wed(1) Thu(2) Fri(3) Sat(4) Sun(5) Mon(6) Tue(7) ... for 31 days
-// and counting Mon-Fri by hand gives 23 weekdays. Hours 7 through 22
-// inclusive is 22 - 7 + 1 = 16 hours per day.
-//   expected = 23 weekdays * 16 hours/day = 368
-
-check('mask for August, weekdays, HE 7-22 has a hand-computed count', () => {
+{
+  // Weekdays taken from the proleptic Gregorian calendar, not from a Date.
+  // 1 Jan 2035 is a Monday; 4 July 2035 a Wednesday; 25 Dec 2035 a Tuesday.
   const calendar = buildCalendar(2035);
-  const filters = {
-    months: new Set([8]),
-    hoursOfDay: new Set([7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]),
-    daysOfWeek: new Set([0, 1, 2, 3, 4]), // Monday..Friday
-    seasons: null,
-    tou: null,
+  const at = (month, day) => {
+    const before = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    return (before[month - 1] + day - 1) * 24;
   };
-  const touBitmap = new Uint8Array(HOURS_PER_YEAR); // unused: filters.tou is null
-  const mask = buildMask(filters, calendar, touBitmap);
-  assert.equal(mask.length, HOURS_PER_YEAR);
-  let kept = 0;
-  for (let h = 0; h < mask.length; h++) kept += mask[h];
-  const weekdaysInAugust2035 = 23; // hand count, see comment above
-  const hoursPerDay = 22 - 7 + 1;
-  const expected = weekdaysInAugust2035 * hoursPerDay;
-  assert.equal(expected, 368);
-  assert.equal(kept, expected);
-});
+  assert.equal(DAY_NAMES[getDayOfWeek(calendar[at(1, 1)])], 'Mon');
+  assert.equal(DAY_NAMES[getDayOfWeek(calendar[at(7, 4)])], 'Wed');
+  assert.equal(DAY_NAMES[getDayOfWeek(calendar[at(12, 25)])], 'Tue');
+  // 2044, one of the years these studies run in: 1 Jan 2044 is a Friday.
+  assert.equal(DAY_NAMES[getDayOfWeek(buildCalendar(2044)[0])], 'Fri');
+  // Consecutive days advance by exactly one weekday, all year.
+  for (let day = 1; day < 365; day++) {
+    const previous = getDayOfWeek(calendar[(day - 1) * 24]);
+    assert.equal(getDayOfWeek(calendar[day * 24]), (previous + 1) % 7, `day ${day}`);
+  }
+  ok('day-of-week is Sakamoto arithmetic, checked against known dates and continuity');
 
-// --- 4. Groupings ---------------------------------------------------------
+  assert.equal(SEASON_NAMES[getSeason(calendar[at(1, 15)])], 'Winter');
+  assert.equal(SEASON_NAMES[getSeason(calendar[at(4, 15)])], 'Spring');
+  assert.equal(SEASON_NAMES[getSeason(calendar[at(7, 15)])], 'Summer');
+  assert.equal(SEASON_NAMES[getSeason(calendar[at(10, 15)])], 'Fall');
+  assert.equal(SEASON_NAMES[getSeason(calendar[at(12, 15)])], 'Winter', 'December is Winter');
+  ok('seasons run Dec-Feb, Mar-May, Jun-Aug, Sep-Nov');
+}
 
-check("areasIn('Zone 1') returns exactly its two member areas", () => {
-  assert.deepEqual(areasIn('Zone 1'), ['AREA01', 'AREA02']);
-});
+// ---------------------------------------------------------------- the mask
 
-// --- 5. Rules ---------------------------------------------------------------
+{
+  const calendar = buildCalendar(2035);
+  const tou = new Uint8Array(HOURS);
+  // OnPeak on hour-ending 6..22, every day: a rule, so that a mask that
+  // recomputed TOU instead of reading it would still pass — which is why the
+  // second bitmap below is deliberately arbitrary.
+  for (let hour = 0; hour < HOURS; hour++) {
+    const he = getHourOfDay(calendar[hour]);
+    tou[hour] = he >= 6 && he <= 22 ? 1 : 0;
+  }
 
-check('Avg LMP Weighted by Load rule is WEIGHTED_MEAN by Load (MWh)', () => {
-  const rule = ruleFor('Avg LMP Weighted by Load ($/MWh)');
-  assert.ok(rule, 'rule not found');
-  assert.equal(rule.series, 'WEIGHTED_MEAN');
-  assert.equal(rule.weight, 'Load (MWh)');
-});
+  const count = (mask) => mask.reduce((total, keep) => total + keep, 0);
 
-check("'Gen - Load' is filed under Calculations, not Load", () => {
-  assert.equal(groupOf('Gen - Load'), CALCULATED_GROUP);
-  assert.equal(groupOf('Load (MWh)'), 'Load');
-  // The folder has to exist as its own group, or the picker cannot mark it.
-  const titles = metricGroups(['Load (MWh)', 'Generation (MWh)', 'Gen - Load']).map((g) => g.title);
-  assert.ok(titles.includes(CALCULATED_GROUP), titles.join(', '));
-});
+  assert.equal(count(buildMask(NO_FILTERS, calendar, tou)), HOURS, 'no filter keeps everything');
 
-// MW and MWh are the same number for a single hour, so they share one chart
-// axis. The scale merge must not leak past the axis: MW stays a rate
-// everywhere else, and a unit that is genuinely a different quantity must
-// still get its own axis or the chart compares nothing.
-check('MW and MWh share one y scale, labelled with both, and nothing else merges', () => {
-  assert.equal(scaleOf('MW'), scaleOf('MWh'), 'a rate held for one hour IS that much energy');
-  assert.notEqual(scaleOf('$/MWh'), scaleOf('MWh'), 'a price is not an energy');
-  assert.notEqual(scaleOf('ratio'), scaleOf('MWh'), 'a dimensionless ratio is not an energy');
+  const january = buildMask({ ...NO_FILTERS, months: new Set([1]) }, calendar, tou);
+  assert.equal(count(january), 31 * 24);
 
-  const merged = scalesOf([{ unit: 'MWh' }, { unit: 'MW' }, { unit: 'MWh' }]);
-  assert.equal(merged.length, 1, 'one axis, not two');
-  assert.equal(merged[0].label, 'MWh · MW', 'the axis must still name both units');
+  const he17 = buildMask({ ...NO_FILTERS, hoursOfDay: new Set([17]) }, calendar, tou);
+  assert.equal(count(he17), 365, 'one hour-ending a day, all year');
 
-  // Three units, two scales: the pane refuses at three, so this has to draw.
-  assert.equal(scalesOf([{ unit: 'MWh' }, { unit: 'MW' }, { unit: '$/MWh' }]).length, 2);
+  const weekend = buildMask({ ...NO_FILTERS, daysOfWeek: new Set([5, 6]) }, calendar, tou);
+  // 2035 starts on a Monday and runs 365 days = 52 weeks + one Monday, so
+  // every other weekday, Saturday and Sunday included, occurs 52 times.
+  assert.equal(count(weekend), 104 * 24, '52 Saturdays and 52 Sundays');
 
-  // The rule table is untouched by any of this -- MW is still CAPACITY, which
-  // is what forbids summing it over hours.
-  assert.equal(ruleFor('Net Load (MW)').class, 'CAPACITY');
-  assert.equal(ruleFor('Net Load (MW)').temporal, 'MEAN');
-});
+  const summer = buildMask({ ...NO_FILTERS, seasons: new Set(['Summer']) }, calendar, tou);
+  assert.equal(count(summer), (30 + 31 + 31) * 24);
 
-// The default selection has to be able to draw its own charts. Nothing is
-// auto-added at load (footgun 20), so a default that names a weighted-mean or
-// calculated column without its inputs ships a set whose panes refuse.
-check('the default column selection is closed under its own dependencies', () => {
-  const everything = rulesData.columns.map((c) => c.canonical.trim());
-  const unknown = DEFAULT_METRICS.filter((name) => !everything.includes(name));
-  assert.deepEqual(unknown, [], 'every default must be a real canonical name');
+  const onPeak = buildMask({ ...NO_FILTERS, tou: new Set(['OnPeak']) }, calendar, tou);
+  assert.equal(count(onPeak), 365 * 17);
+  ok('each filter alone keeps exactly the hours it names');
 
-  const picked = defaultSelection(everything);
-  assert.deepEqual(requiredInputs(picked), [], 'a default must not need a column it leaves out');
-  assert.ok(picked.length > 0 && picked.length < everything.length, `${picked.length} of ${everything.length}`);
-});
+  // Combined filters intersect.
+  const narrow = buildMask(
+    {
+      months: new Set([7]),
+      hoursOfDay: new Set([17, 18]),
+      daysOfWeek: new Set([0, 1, 2, 3, 4]),
+      seasons: new Set(['Summer']),
+      tou: new Set(['OnPeak']),
+    },
+    calendar,
+    tou,
+  );
+  let expected = 0;
+  for (let hour = 0; hour < HOURS; hour++) {
+    const entry = calendar[hour];
+    const he = getHourOfDay(entry);
+    if (
+      getMonth(entry) === 7 &&
+      (he === 17 || he === 18) &&
+      getDayOfWeek(entry) <= 4 &&
+      SEASON_NAMES[getSeason(entry)] === 'Summer' &&
+      TOU_LABELS[tou[hour]] === 'OnPeak'
+    ) {
+      expected++;
+    }
+  }
+  assert.equal(count(narrow), expected);
+  assert.ok(expected > 0, 'the combined filter must keep something to be a test');
+  ok(`combined filters intersect (${expected} hours kept by all five)`);
 
-check('an unrecognised schema falls back to keeping everything', () => {
-  // A picker that opens with nothing ticked reads as a failed load.
-  assert.deepEqual(defaultSelection(['Some Future Column', 'Another']), [
-    'Some Future Column',
-    'Another',
-  ]);
-});
+  // TOU is read, never recomputed (footgun 17). This bitmap follows no rule a
+  // calendar could produce, and the mask must follow it exactly.
+  const arbitrary = new Uint8Array(HOURS);
+  for (let hour = 0; hour < HOURS; hour++) arbitrary[hour] = (hour * 7919) % 3 === 0 ? 1 : 0;
+  const readTou = buildMask({ ...NO_FILTERS, tou: new Set(['OnPeak']) }, calendar, arbitrary);
+  for (let hour = 0; hour < HOURS; hour++) {
+    assert.equal(readTou[hour], arbitrary[hour], `TOU at hour ${hour} must come from the file`);
+  }
+  ok('the TOU filter follows the file\'s own bitmap, whatever shape it has');
 
-console.log(`\n${passed} checks passed`);
+  // The output buffer is reused across interactions: it must be fully
+  // rewritten, never OR-ed into.
+  const buffer = new Uint8Array(HOURS).fill(1);
+  buildMask({ ...NO_FILTERS, months: new Set([2]) }, calendar, tou, buffer);
+  assert.equal(count(buffer), 28 * 24, 'a reused buffer is overwritten, not merged');
+  ok('buildMask overwrites the caller-owned buffer completely');
+}
+
+// ---------------------------------------------------------------- status line
+
+{
+  const query = {
+    cases: ['01_PF', '02_PF'],
+    interfaces: ['P84 Alpha N-S'],
+    filters: { ...NO_FILTERS },
+    boxDim: 'case',
+  };
+  const sentence = statusSentence(query, 8760);
+  assert.match(sentence, /8,760 of 8,760 h/);
+  assert.match(sentence, /all months/);
+  assert.match(sentence, /P84 Alpha N-S/);
+  assert.match(sentence, /2 cases/);
+
+  const filtered = statusSentence(
+    {
+      ...query,
+      filters: {
+        ...NO_FILTERS,
+        months: new Set([1, 2, 3, 7]),
+        hoursOfDay: new Set([17, 18]),
+        tou: new Set(['OnPeak']),
+      },
+    },
+    1234,
+  );
+  assert.match(filtered, /Jan–Mar, Jul/, 'runs collapse, gaps do not');
+  assert.match(filtered, /HE 17–18/);
+  assert.match(filtered, /OnPeak/);
+  ok('the status bar states its own filters, with runs collapsed');
+
+  // Ten selected paths would push the filters off the end of the bar.
+  const many = statusSentence(
+    { ...query, interfaces: MONTH_NAMES.map((m) => `${m} path`) },
+    8760,
+  );
+  assert.match(many, /12 interfaces/);
+  assert.ok(!many.includes('Jan path'), 'a long interface list is summarised, not listed');
+  ok('a long interface selection is counted rather than spelled out');
+}
+
+console.log(`\n${checks} checks passed.`);

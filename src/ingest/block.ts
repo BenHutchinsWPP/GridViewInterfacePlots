@@ -4,15 +4,16 @@
 // whole rows, lift the active planes back out of the slab.
 //
 // This lives apart from worker.ts on purpose. It is the riskiest index
-// arithmetic in the build -- slab plane -> cube metric, area-major with an
-// hour stride of MAX_BLOCK_HOURS -- so test_ingest.mjs (T4) drives *this*
-// code directly in node rather than a reimplementation of it. worker.ts is
-// then only plumbing: read bytes, call this, transfer the result.
+// arithmetic in the build -- slab plane -> cube interface, with an hour stride
+// of MAX_BLOCK_HOURS -- so test_ingest.mjs (T4) drives *this* code directly in
+// node rather than a reimplementation of it. worker.ts is then only plumbing:
+// read bytes, call this, transfer the result.
 
-import { SLAB_AREAS, SLAB_METRICS } from './header';
+import { SLAB_METRICS } from './header';
 
-/** block.c's MAX_BLOCK_HOURS. Compiled in, not exported by the module. */
-export const MAX_BLOCK_HOURS = 1024;
+/** block.c's MAX_BLOCK_HOURS. Compiled in, and checked against the module's
+ * own `slab_hours()` at instantiation. */
+export const MAX_BLOCK_HOURS = 4096;
 
 export const NEWLINE = 10;
 
@@ -22,15 +23,15 @@ export interface ParserExports {
   inbuf_size(): number;
   slab_ptr(): number;
   tou_ptr(): number;
-  area_seen_ptr(): number;
   slab_hours(): number;
+  slab_metrics(): number;
   last_rows(): number;
   last_base_hour(): number;
   last_max_hour(): number;
-  last_unknown_area(): number;
   last_out_of_range(): number;
-  area_table_reset(): void;
-  area_table_put(hash: number, idx: number): void;
+  last_wide_field(): number;
+  last_bad_row(): number;
+  last_feb29(): number;
   slab_fill_nan(hours: number): void;
   parse_block(len: number, baseHour: number): number;
 }
@@ -39,15 +40,15 @@ export interface ParserExports {
 export interface BlockPayload {
   /** Hour-of-year the block's first covered hour maps to. */
   baseHour: number;
-  /** Hours covered, so `data` is [activePlanes x SLAB_AREAS x hours]. */
+  /** Hours covered, so `data` is [activePlanes x hours]. */
   hours: number;
   rows: number;
-  /** data[(p * SLAB_AREAS + area) * hours + t] for active plane p. */
+  /** data[p * hours + t] for active plane p. */
   data: Float32Array;
   /** Per-hour TOU code straight from the file's TOU column; 0xFF = uncovered. */
   tou: Uint8Array;
-  /** 1 = this area had at least one row in the block. */
-  areaSeen: Uint8Array;
+  /** Rows dropped because they are Feb 29 (D4) -- intended, and stated. */
+  feb29: number;
 }
 
 /** A block that contributed nothing. Freshly allocated every time: the
@@ -60,29 +61,31 @@ function emptyPayload(): BlockPayload {
     rows: 0,
     data: new Float32Array(0),
     tou: new Uint8Array(0),
-    areaSeen: new Uint8Array(SLAB_AREAS),
+    feb29: 0,
   };
 }
 
 /**
- * Instantiate the parser and fill its area hash table. Every worker needs
- * its own instance: linear memory cannot be shared without SharedArrayBuffer,
- * which D2 forbids on GitHub Pages.
+ * Instantiate the parser. Every worker needs its own instance: linear memory
+ * cannot be shared without SharedArrayBuffer, which D2 forbids on GitHub
+ * Pages.
+ *
+ * Both slab dimensions are checked against this module's mirrored constants.
+ * A rebuilt block.c with a different NUM would otherwise be read with the old
+ * stride -- every plane after the first shifted by a fixed offset, every
+ * number plausible.
  */
-export async function instantiateParser(
-  module: WebAssembly.Module,
-  hashes: Uint32Array,
-): Promise<ParserExports> {
+export async function instantiateParser(module: WebAssembly.Module): Promise<ParserExports> {
   const instance = await WebAssembly.instantiate(module, {});
   const parser = instance.exports as unknown as ParserExports;
-  if (parser.slab_hours() !== MAX_BLOCK_HOURS) {
+  if (parser.slab_hours() !== MAX_BLOCK_HOURS || parser.slab_metrics() !== SLAB_METRICS) {
     throw new Error(
-      `block.wasm reports slab_hours()=${parser.slab_hours()} but this module mirrors ` +
-        `MAX_BLOCK_HOURS=${MAX_BLOCK_HOURS}. Rebuild the parser or fix the constant.`,
+      `block.wasm reports slab_hours()=${parser.slab_hours()}, ` +
+        `slab_metrics()=${parser.slab_metrics()}, but this build mirrors ` +
+        `MAX_BLOCK_HOURS=${MAX_BLOCK_HOURS}, SLAB_METRICS=${SLAB_METRICS}. ` +
+        `Rebuild the parser or fix the constants.`,
     );
   }
-  parser.area_table_reset();
-  for (let i = 0; i < hashes.length; i++) parser.area_table_put(hashes[i], i);
   return parser;
 }
 
@@ -124,12 +127,19 @@ export function parseBytes(
   const rows = parser.parse_block(padded, 0xffffffff);
   if (rows === 0) return emptyPayload();
 
-  const unknown = parser.last_unknown_area();
-  if (unknown > 0) {
+  const wide = parser.last_wide_field();
+  if (wide > 0) {
     throw new Error(
-      `${unknown} row(s) carry an area name that is not on the area axis read from this ` +
-        `export's first hour. Those rows would be dropped silently, so the load is refused ` +
-        `instead.`,
+      `${wide} field(s) sit past column ${SLAB_METRICS + 3} — this export is wider than ` +
+        `parser/block.c's ${SLAB_METRICS}-interface slab. Those columns would be dropped ` +
+        `silently, so the load is refused instead. Widen NUM in block.c and rebuild.`,
+    );
+  }
+  const bad = parser.last_bad_row();
+  if (bad > 0) {
+    throw new Error(
+      `${bad} row(s) carry a Date or Hour this parser could not read (expected M/D/YYYY and ` +
+        `an hour-ending 1-24). Those rows would be dropped silently, so the load is refused.`,
     );
   }
   const outOfRange = parser.last_out_of_range();
@@ -143,22 +153,14 @@ export function parseBytes(
   const baseHour = parser.last_base_hour();
   const hours = parser.last_max_hour() + 1;
 
-  const slab = new Float32Array(
-    parser.memory.buffer,
-    parser.slab_ptr(),
-    SLAB_AREAS * SLAB_METRICS * MAX_BLOCK_HOURS,
-  );
-  const data = new Float32Array(activePlanes.length * SLAB_AREAS * hours);
+  const slab = new Float32Array(parser.memory.buffer, parser.slab_ptr(), SLAB_METRICS * MAX_BLOCK_HOURS);
+  const data = new Float32Array(activePlanes.length * hours);
   for (let p = 0; p < activePlanes.length; p++) {
-    const plane = activePlanes[p];
-    for (let area = 0; area < SLAB_AREAS; area++) {
-      const src = (area * SLAB_METRICS + plane) * MAX_BLOCK_HOURS;
-      data.set(slab.subarray(src, src + hours), (p * SLAB_AREAS + area) * hours);
-    }
+    const src = activePlanes[p] * MAX_BLOCK_HOURS;
+    data.set(slab.subarray(src, src + hours), p * hours);
   }
 
   const tou = new Uint8Array(parser.memory.buffer, parser.tou_ptr(), MAX_BLOCK_HOURS);
-  const areaSeen = new Uint8Array(parser.memory.buffer, parser.area_seen_ptr(), SLAB_AREAS);
 
   return {
     baseHour,
@@ -166,7 +168,7 @@ export function parseBytes(
     rows,
     data,
     tou: tou.slice(0, hours),
-    areaSeen: areaSeen.slice(0, SLAB_AREAS),
+    feb29: parser.last_feb29(),
   };
 }
 

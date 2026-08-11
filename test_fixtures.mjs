@@ -1,57 +1,43 @@
 // test_fixtures.mjs
 //
-// Synthetic test data, generated in memory. NOTHING data-shaped is tracked in
-// this repo: the real export and the real area -> grouping rollup are
-// gitignored local files, and the tests never read them.
+// Synthetic test data, generated in memory. Nothing here comes from a real
+// study: the interface names, the values and the calendar are invented, and
+// only the FORMAT is copied from GridView's exporter.
 //
 // The synthetic export is not decorative. It has to reproduce every property
 // the ingest tests actually gate on, because a fixture that quietly loses one
 // turns a real parser bug into a passing run:
 //
+//   * The four preamble lines and a header on line 5, which is the whole
+//     difference in shape from the area exports (docs/data-format.md).
+//   * A title line naming a quoted quantity and a year — the file's unit and
+//     its aggregation rule are read from there and nowhere else.
 //   * CRLF throughout, so the last-column trailing-\r trap is exercised
 //     (footgun 16). The last numeric column is populated in every row, or the
 //     check that covers that trap compares nothing and passes vacuously.
-//   * Exactly SLAB_AREAS areas, every one present in every hour — the axis is
-//     read from the first hour's rows, and block sizing assumes it.
-//   * Exponent notation, which is in the real exports and parsed to NaN for a
-//     whole build before the parity test caught it (footgun 24).
+//   * Exponent notation, which is in the real exports (`2.568664E-03`) and
+//     parsed to NaN for a whole build before the parity test caught it.
 //   * Both TOU labels, since TOU is read from the file and never recomputed
 //     (footgun 17).
-//   * A leap year, so the D4 Feb 29 statement has something to fire on.
-//   * Stray spaces in the header (` Hour`, ` TOU`, ` Name`), which the real
-//     export has and which is why columns map by TRIMMED name (footgun 18).
-//   * Enough bytes to split into several blocks at the sizes the tests use.
-//
-// Column NAMES come from data/aggregation-rules.json — they are the GridView
-// product's schema, not any utility's data. Area names and every value here
-// are invented.
+//   * Interface names with spaces, hyphens, plus signs and doubled
+//     underscores — the real ones have all of these, and they must survive a
+//     trim and an exact-name match without being "cleaned up".
+//   * Optionally Feb 29, so the D4 drop has something to fire on.
 
-import { readFileSync } from 'node:fs';
-
-const rules = JSON.parse(
-  readFileSync(new URL('./data/aggregation-rules.json', import.meta.url), 'utf8'),
-);
-
-/** Generic area axis. Distinctness matters: block.c routes rows by FNV-1a of
- * the name, and a collision would file one area's rows into another's plane
- * with no error at all. test_ingest asserts that via areaHashes(). */
-export const AREAS = Array.from({ length: 43 }, (_, i) => `AREA${String(i + 1).padStart(2, '0')}`);
-
-/** Five groups over the 43 areas, the same shape as a real rollup: uneven
- * sizes, every area in exactly one group. */
-export const GROUPS = [
-  ['Zone 1', AREAS.slice(0, 2)],
-  ['Zone 2', AREAS.slice(2, 11)],
-  ['Zone 3', AREAS.slice(11, 23)],
-  ['Zone 4', AREAS.slice(23, 34)],
-  ['Zone 5', AREAS.slice(34)],
+/** Interface names in the shapes the real exports use. Invented; the shapes
+ * are what matters -- a name with a comma would be a different problem and
+ * GridView does not emit one. */
+const NAME_SHAPES = [
+  (i) => `P${String(i).padStart(2, '0')} Alpha Beta ${i % 2 ? 'N-S' : 'E-W'}`,
+  (i) => `W${String(i).padStart(2, '0')}_AA_ONE__BB_TWO_1`,
+  (i) => `Pth ${String(i).padStart(2, '0')} Gamma - Delta`,
+  (i) => `AA${String(i).padStart(2, '0')}_Epsilon+`,
 ];
 
-/** A Groupings.csv: one row per (area, group), header included. */
-export function groupingsCsv() {
-  const lines = ['Name,Grouping'];
-  for (const [group, members] of GROUPS) for (const area of members) lines.push(`${area},${group}`);
-  return lines.join('\n') + '\n';
+/** `count` distinct interface names. Distinctness matters: columns map by
+ * trimmed name, and a duplicate would double-write one cube plane. */
+export function interfaceNames(count = 12) {
+  return Array.from({ length: count }, (_, i) => NAME_SHAPES[i % NAME_SHAPES.length](i + 1));
 }
 
 /** Deterministic; a fixture that changes between runs cannot be compared
@@ -66,16 +52,24 @@ function rng(seed) {
   };
 }
 
-/** Non-leap month lengths. Feb 29 is never emitted even in a leap year --
- * ingest drops it (D4), so a fixture that contained it would be testing a row
- * the app is defined to throw away. */
+/** Non-leap month lengths. Feb 29 is emitted only when asked for, and then
+ * only to prove ingest drops it (D4). */
 const MONTH_LENGTHS = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 
-function headerLine(metrics) {
-  // The real header carries stray leading spaces on three key columns and on
-  // some metrics. Columns map by trimmed name precisely so this is harmless --
-  // keep it, or the test stops proving that.
-  return ['Date', ' Hour', ' TOU', ' Name', ...metrics.map((n, i) => (i % 7 === 3 ? ` ${n}` : n))].join(',');
+function preamble(quantity, year) {
+  return [
+    `Interface Hourly '${quantity}' Data for Year ${year}`,
+    '',
+    `(From the first hour of 1/1/${year} to the last hour of 12/31/${year}. Column identifier -- InterfaceName)`,
+    '',
+  ];
+}
+
+function headerLine(names) {
+  // The real header carries a stray leading space on Hour and TOU, and some
+  // interface names arrive padded. Columns map by trimmed name precisely so
+  // this is harmless -- keep it, or the test stops proving that.
+  return ['Date', ' Hour', ' TOU', ...names.map((n, i) => (i % 5 === 2 ? ` ${n}` : n))].join(',');
 }
 
 /**
@@ -83,24 +77,26 @@ function headerLine(metrics) {
  * hour-ending 1..24 within each -- block.c rejects an Hour outside that range,
  * so a longer file has to advance the DATE, not the hour.
  */
-function* rows({ year, days, hours, seed }) {
-  // Calculated columns (`derived`) are computed at ingest from other planes and
-  // are in NO real export's header. Emitting one here would both misrepresent
-  // the format and push the real columns past block.c's 50-metric slab.
-  const metrics = rules.columns
-    .filter((column) => column.derived === undefined)
-    .map((column) => column.canonical.trim());
+function* rows({ year, days, hours, seed, names, quantity, feb29 }) {
   const next = rng(seed);
-  yield headerLine(metrics);
+  for (const line of preamble(quantity, year)) yield line;
+  yield headerLine(names);
 
   let month = 1;
   let day = 1;
   for (let d = 0; d < days; d++) {
     for (let hour = 1; hour <= hours; hour++) {
       const tou = hour % 2 === 0 ? 'OnPeak' : 'OffPeak';
-      for (const area of AREAS) {
-        const fields = [`${month}/${day}/${year}`, String(hour), tou, area];
-        for (let m = 0; m < metrics.length; m++) fields.push(value(next, m));
+      const fields = [`${month}/${day}/${year}`, String(hour), tou];
+      for (let m = 0; m < names.length; m++) fields.push(value(next, m));
+      yield fields.join(',');
+    }
+    // Feb 29, when asked for: the rows exist in the file and must not exist
+    // in the cube (D4).
+    if (feb29 && month === 2 && day === 28) {
+      for (let hour = 1; hour <= hours; hour++) {
+        const fields = [`2/29/${year}`, String(hour), 'OffPeak'];
+        for (let m = 0; m < names.length; m++) fields.push(value(next, m));
         yield fields.join(',');
       }
     }
@@ -111,24 +107,46 @@ function* rows({ year, days, hours, seed }) {
   }
 }
 
-/** One synthetic export as raw bytes. Small by default — the ingest tests want
- * a couple of hours, not a year. Use `writeExportCsv` for anything large. */
-export function exportCsv({ year = 2036, days = 1, hours = 2, seed = 12345 } = {}) {
+/**
+ * One synthetic export as raw bytes. Small by default — the ingest tests want
+ * a couple of days, not a year.
+ */
+export function exportCsv({
+  year = 2036,
+  days = 1,
+  hours = 2,
+  seed = 12345,
+  names = interfaceNames(),
+  quantity = 'Power Flow (MW)',
+  feb29 = false,
+} = {}) {
   // CRLF throughout, including a terminator on the final row.
-  return new TextEncoder().encode([...rows({ year, days, hours, seed })].join('\r\n') + '\r\n');
+  return new TextEncoder().encode(
+    [...rows({ year, days, hours, seed, names, quantity, feb29 })].join('\r\n') + '\r\n',
+  );
 }
 
 /**
- * Stream a full-size export to `path`. A year of 43 areas x 50 metrics is
- * ~190 MB — joining that as one string is how a fixture generator turns into
- * an out-of-memory crash, so this writes incrementally.
+ * Stream a full-size export to `path`. A year of 167 interfaces is ~13 MB —
+ * still joinable as one string, but the tests that want a year want it on
+ * disk, and streaming keeps the generator honest at any width.
  */
-export async function writeExportCsv(path, { year = 2036, days = 365, hours = 24, seed = 12345 } = {}) {
+export async function writeExportCsv(path, options = {}) {
   const { createWriteStream } = await import('node:fs');
   const { once } = await import('node:events');
+  const settings = {
+    year: 2036,
+    days: 365,
+    hours: 24,
+    seed: 12345,
+    names: interfaceNames(),
+    quantity: 'Power Flow (MW)',
+    feb29: false,
+    ...options,
+  };
   const out = createWriteStream(path);
   let chunk = '';
-  for (const row of rows({ year, days, hours, seed })) {
+  for (const row of rows(settings)) {
     chunk += row + '\r\n';
     if (chunk.length > 1 << 20) {
       if (!out.write(chunk)) await once(out, 'drain');
@@ -146,10 +164,11 @@ export async function writeExportCsv(path, { year = 2036, days = 365, hours = 24
 function value(next, index) {
   const r = next();
   if (index % 17 === 5) return '0';
-  // Exponent notation -- real exports carry `7E-05` and it parsed to NaN for a
-  // whole build (footgun 24).
-  if (index % 23 === 7) return `${(r * 9 + 1).toFixed(0)}E-05`;
-  if (index % 11 === 2) return (-r * 1000).toFixed(6);
+  // Exponent notation -- real exports carry `2.568664E-03` for near-zero
+  // flows, and it parsed to NaN for a whole build.
+  if (index % 23 === 7) return `${(r * 9 + 1).toFixed(6)}E-03`;
+  // Flows are signed: a path runs both ways and the sign is the direction.
+  if (index % 3 === 2) return (-r * 2000).toFixed(6);
   // Eight significant digits: the shape that makes block.c's two-step rounding
   // differ from strtod by under one ulp on a handful of cells.
   if (index % 13 === 4) return (r * 100000).toFixed(8);

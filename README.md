@@ -1,31 +1,31 @@
-# GridView Area Plots
+# GridView Interface Plots
 
-A **browser-only** tool for comparing GridView production-cost simulation runs. Drag several case CSVs onto the page, pick the metrics you care about, and get interactive time-series, duration curves, box plots and stats tables that re-filter live.
+A **browser-only** tool for comparing GridView production-cost runs on their **monitored interfaces** — the transmission paths and boundaries a study watches. Drag several exports onto the page, pick the paths you care about, and get interactive time series, duration curves, box plots and statistics tables that re-filter live.
 
 **Data never leaves the machine.** No backend, no upload — static hosting on GitHub Pages, everything in browser memory.
+
+> This tool is the sibling of an area-export plotter and reuses its ingest path, its four views and its filters. The data model is what changed: an interface export is **one quantity for every path it monitors**, so a path is a COLUMN and the quantity belongs to the FILE ([D13](docs/decisions.md#d13--one-file-is-one-quantity-a-path-is-a-column)).
 
 ---
 
 ## The data
 
-Each GridView simulation exports one CSV: `case1.csv`, `case2.csv`, … Each file is **one full year of hours for every area**.
+Each GridView export is one CSV: one quantity, one year, every monitored interface.
 
 | | |
 |---|---|
-| Rows per case | **376,680** = 43 areas × 8,760 hours |
-| Columns | **54** — `Date`, `Hour`, `TOU`, `Name`, + 50 numeric metrics |
-| File size | **~139 MB** (364 bytes/row) |
-| Line endings | CRLF |
-| Row order | area-fastest within `(date, hour)` |
-| Years | mixed across cases (2034 / 2035 / 2044) |
+| Rows | **8,760** — one per hour. Not one per (hour × area) |
+| Header | **line 5.** Four preamble lines sit above it |
+| Key columns | `Date`, `Hour`, `TOU` — three, not four; there is no `Name` |
+| Interface columns | **167** in the sample exports, one per monitored path |
+| Quantity | named on the title line: `Interface Hourly 'Power Flow (MW)' Data for Year 2034` |
+| File size | 12.4 MB for a flow export (1,488 B/row), 5.8 MB for a congestion export |
 
-Ten cases at once is the design target. Stored as a `Float32Array` cube of `[area × metric × hour]`, that is **~75 MB per case, ~750 MB for ten** at full column width, and less in proportion to the metrics kept.
-
-Full detail: **[docs/data-format.md](docs/data-format.md)**
+Full detail, with measurements: **[docs/data-format.md](docs/data-format.md)**
 
 ## What it does
 
-Build a single time series from **case × (area | grouping) × metric**, apply context filters (month, day-of-week, hour, season, TOU), then plot it four ways. A *grouping* is a named set of areas (e.g. `Zone 1` = `AREA01` + `AREA02`) summed into one series.
+Build a time series from **case × interface**, apply context filters (month, day-of-week, hour, season, TOU), then plot it four ways. The unit and the aggregation rule come from the file's own title line, so a flow in MW and a congestion cost in $ overlay on two axes and only the $ column offers a period total.
 
 Full detail: **[docs/features.md](docs/features.md)**
 
@@ -38,10 +38,10 @@ Start here and follow the links — every document is reachable from this page.
 ### Understand the problem
 | Document | What it covers |
 |---|---|
-| [docs/data-format.md](docs/data-format.md) | The GridView CSV: every column, real-file measurements, format quirks |
-| [docs/glossary.md](docs/glossary.md) | Utility and analysis terms — LMP, A.S., TOU, extensive vs intensive |
-| [docs/features.md](docs/features.md) | Filters, plots, tables, groupings, the column picker |
-| [docs/aggregation-semantics.md](docs/aggregation-semantics.md) | Which metrics may be summed and which need a weighted mean. **Load-bearing at runtime** |
+| [docs/data-format.md](docs/data-format.md) | The interface export: preamble, header, columns, measured characteristics |
+| [docs/glossary.md](docs/glossary.md) | Utility and analysis terms — interface, congestion, TOU, extensive vs intensive |
+| [docs/features.md](docs/features.md) | Filters, plots, tables, the interface picker |
+| [docs/aggregation-semantics.md](docs/aggregation-semantics.md) | Which quantities may be summed over hours and which may not. **Load-bearing at runtime** |
 
 ### Understand the build
 | Document | What it covers |
@@ -52,7 +52,7 @@ Start here and follow the links — every document is reachable from this page.
 ### Understand the constraints
 | Document | What it covers |
 |---|---|
-| [docs/decisions.md](docs/decisions.md) | Binding decisions (D1–D12), cited by number from `src/` |
+| [docs/decisions.md](docs/decisions.md) | Binding decisions (D1–D14), cited by number from `src/` |
 | [docs/footguns.md](docs/footguns.md) | Traps that have already bitten, or will. **Read before writing ingest or stats code** |
 | [docs/status.md](docs/status.md) | What the app does today, what it does not, and the conventions in the code |
 
@@ -62,8 +62,9 @@ Start here and follow the links — every document is reachable from this page.
 |---|---|
 | [`src/`](src/) | The app: ingest pool, kernels, the four views. Entry point `src/main.ts` |
 | [`parser/`](parser/) | The WASM CSV parser (C → wasm32+SIMD128). See [docs/csv-parsing.md](docs/csv-parsing.md) |
-| [`data/aggregation-rules.json`](data/aggregation-rules.json) | Machine-readable aggregation rules, imported directly by the app. See [docs/aggregation-semantics.md](docs/aggregation-semantics.md) |
-| `test_fixtures.mjs` | Synthetic export + grouping mapping the tests generate in memory. No real data is tracked in this repo |
+| [`data/quantity-rules.json`](data/quantity-rules.json) | Machine-readable unit rules, imported directly by the app. See [docs/aggregation-semantics.md](docs/aggregation-semantics.md) |
+| [`input/`](input/) | Anonymised sample exports — two power-flow runs and two congestion-cost runs |
+| `test_fixtures.mjs` | Synthetic export the unit tests generate in memory |
 
 ## Running it
 
@@ -80,21 +81,20 @@ sudo apt-get install -y lld-18   # supplies wasm-ld; clang 18 is already present
 ./parser/build.sh                # produces parser/block.wasm — commit the result
 ```
 
-Checks — plain node, no test framework. Everything runs on a synthetic export
-generated in memory by `test_fixtures.mjs`; no real data is tracked in or read
-by this repo.
+Checks — plain node, no test framework:
 
 ```bash
-npm test                         # tsc --noEmit + the three scripts below
-node test_calendar.mjs           # calendar, groupings, column grouping, rules
-node test_kernels.mjs            # aggregation and statistics
-node test_ingest.mjs             # parser parity vs a JS reference
+npm test                         # tsc --noEmit + the four scripts below
+node test_calendar.mjs           # calendar, keep-mask, the status sentence
+node test_kernels.mjs            # series, statistics, unit rules
+node test_ingest.mjs             # parser parity vs a JS reference, on a synthetic export
+node test_samples.mjs            # the same parity check against input/*.csv
 ```
 
-`test_loader.mjs` is shared setup, not a test: it registers the hook that lets
-Node import `src/*.ts` with extensionless specifiers, and seeds the area axis
-and grouping mapping from the synthetic fixture — at runtime both come from the
-files the user drops, so a test process has to supply them.
+`test_samples.mjs` skips itself when `input/` holds no CSVs, so a clone without
+the samples still runs the full suite. `test_loader.mjs` is shared setup, not a
+test: it registers the hook that lets Node import `src/*.ts` with extensionless
+specifiers.
 
 ## Deploying
 
@@ -114,22 +114,18 @@ change the C, rebuild and commit the binary in the same change.
 
 ## Status
 
-Ingest, kernels, all four views, the column picker and OPFS save/load are all in
-place. Filtering and redrawing a ten-case overlay runs in tens of milliseconds;
-reloading ten cases from the cache takes about half a second at a typical
-8-metric session and about two seconds with all 50 columns retained.
+Ingest, all four views, the interface picker and save/load are in place, and
+the whole path is verified against the sample exports: **5,851,680 cells match
+an independent JS reference exactly**, and the app's own statistics table
+matches figures computed independently from the CSV text, filters included.
 
-[docs/status.md](docs/status.md) has the detail, the limits, and the conventions
-the code relies on.
+[docs/status.md](docs/status.md) has the detail, the limits, and the
+conventions the code relies on.
 
 ## Privacy
 
-This repo has a public remote and is deployed publicly. **No real data is tracked in it.** The real export, the real grouping rollup and the full 139 MB export were deleted; the tests build their own synthetic export and mapping in `test_fixtures.mjs`.
-
-Rules for agents: never push. Write changes in chunks, squash to the minimum necessary history, then stop for human review.
-
-```bash
-git status --porcelain | grep -i '\.csv$'   # no data files should ever appear
-```
-
-Never paste raw rows into docs, results or issues. Aggregate statistics and timings are fine.
+This repo has a public remote and is deployed publicly. The exports in
+[`input/`](input/) are **anonymised samples**, committed deliberately; real
+study exports are not tracked, and `.gitignore` covers the names they arrive
+under. Never paste raw rows into docs, results or issues — aggregate
+statistics and timings are fine.

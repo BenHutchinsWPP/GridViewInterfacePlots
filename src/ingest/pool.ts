@@ -4,43 +4,43 @@
 //
 // The pool's unit of work is a BYTE RANGE, not a case (D10). One dropped
 // file therefore uses every core, which is the common interaction, and ten
-// dropped files queue into the same pool rather than a second one. Workers
-// are pre-warmed at page load because startup is ~40 ms each.
+// dropped files queue into the same pool rather than a second one.
 //
 // Two things in here are load-bearing for correctness rather than speed:
 //
 //   * The cube is pre-filled with NaN. "Never written" then looks exactly
-//     like "this case never exported that column" -- both NaN, both refused
+//     like "this file never carried that interface" -- both NaN, both refused
 //     by the presence bitmap. Leaving the allocator's zeros in place would
 //     turn a truncated file into 8,760 hours of plausible zeros.
 //   * Block size is derived from the file's own row length, not fixed at
-//     8 MiB, so one block can never span more than block.c's 1,024-hour
-//     slab window on a narrow export.
+//     8 MiB, so one block can never span more than block.c's slab window on a
+//     narrow export.
 
 import { HOURS_PER_YEAR } from '../calendar';
-import { derivedFor, requiredInputs, ruleFor } from '../rules';
+import { unitOf } from '../rules';
 import type { CaseData } from '../types';
 import {
-  areaHashes,
   buildColumnPlan,
   parseHeaderLine,
+  parseTitleLine,
   unionSchema,
-  SLAB_AREAS,
+  PREAMBLE_LINES,
   type ColumnPlan,
   type HeaderInfo,
+  type TitleInfo,
 } from './header';
-import type { BlockPayload } from './block';
+import { MAX_BLOCK_HOURS, NEWLINE, type BlockPayload } from './block';
 import type { BlockMessage, BlockResult, InitMessage, WorkerResponse } from './worker';
 
 /** D10: >= 8 MiB. 1 MiB blocks measure *worse* than plain streaming. */
 export const BLOCK_TARGET_BYTES = 8 * 1024 * 1024;
 
-/** Of block.c's MAX_BLOCK_HOURS = 1024, leaving headroom for row-length
- * variance. Exceeding it is caught and refused in the worker, not silently
- * dropped, but sizing blocks so it cannot happen is cheaper than the error. */
-const SAFE_BLOCK_HOURS = 900;
+/** Of block.c's MAX_BLOCK_HOURS, leaving headroom for row-length variance.
+ * Exceeding it is caught and refused in the worker, not silently dropped, but
+ * sizing blocks so it cannot happen is cheaper than the error. */
+const SAFE_BLOCK_HOURS = Math.floor(MAX_BLOCK_HOURS * 0.9);
 
-/** Enough for the real export's 1,028 B header plus a first data row. */
+/** Enough for the four preamble lines, a ~4 KB header and a first data row. */
 const HEAD_PROBE_BYTES = 256 * 1024;
 
 /** The whole file is read through the pool; this is only the header probe. */
@@ -49,17 +49,17 @@ const decoder = new TextDecoder();
 export interface CasePlan {
   file: File;
   header: HeaderInfo;
+  /** What the title line says this file measures. */
+  title: TitleInfo;
   /** Byte offset of the first data row -- block 0 starts here, not at 0. */
   dataStart: number;
   year: number;
   bytesPerRow: number;
-  /** Area names in file order -- this case's area axis, read from the file. */
-  areas: string[];
 }
 
 export interface IngestResult {
   cases: CaseData[];
-  /** User-facing notes: dropped Feb 29, missing weights, partial coverage. */
+  /** User-facing notes: dropped Feb 29, absent columns, partial coverage. */
   warnings: string[];
 }
 
@@ -88,17 +88,57 @@ export const NO_SIMD_MESSAGE =
 
 // ---------------------------------------------------------------- header probe
 
-/** Read one file's header and enough of its first row to size blocks. */
+/** Byte offset just past the `n`-th newline in `bytes`, or -1. */
+function skipLines(bytes: Uint8Array, n: number): number {
+  let at = 0;
+  for (let i = 0; i < n; i++) {
+    const nl = bytes.indexOf(NEWLINE, at);
+    if (nl < 0) return -1;
+    at = nl + 1;
+  }
+  return at;
+}
+
+/** The case label: the file name without its extension. */
+export function caseNameOf(filename: string): string {
+  return filename.replace(/\.[^.]+$/, '');
+}
+
+/**
+ * Read one file's preamble, header, and enough of its first row to size
+ * blocks.
+ *
+ * The header is line 5, under four preamble lines (PREAMBLE_LINES). Those
+ * lines are not skipped by "keep reading until something parses as a header":
+ * a title line happens to contain commas, so a tolerant scan would happily
+ * accept `Interface Hourly 'Power Flow (MW)' Data for Year 2034` as a
+ * three-column header and then fail somewhere less obvious.
+ */
 export async function readCasePlan(file: File): Promise<CasePlan> {
   const probe = new Uint8Array(await file.slice(0, HEAD_PROBE_BYTES).arrayBuffer());
-  const headerEnd = probe.indexOf(10);
-  if (headerEnd < 0) {
+
+  const titleEnd = probe.indexOf(NEWLINE);
+  if (titleEnd < 0) {
     throw new Error(`${file.name}: no line ending in the first ${HEAD_PROBE_BYTES} B.`);
   }
-  const header = parseHeaderLine(decoder.decode(probe.subarray(0, headerEnd)));
+  const title = parseTitleLine(decoder.decode(probe.subarray(0, titleEnd)));
+
+  const headerStart = skipLines(probe, PREAMBLE_LINES);
+  if (headerStart < 0) {
+    throw new Error(
+      `${file.name}: fewer than ${PREAMBLE_LINES + 1} lines — a GridView interface export ` +
+        `opens with ${PREAMBLE_LINES} preamble lines and carries its column header on line ` +
+        `${PREAMBLE_LINES + 1}.`,
+    );
+  }
+  const headerEnd = probe.indexOf(NEWLINE, headerStart);
+  if (headerEnd < 0) {
+    throw new Error(`${file.name}: no column header within the first ${HEAD_PROBE_BYTES} B.`);
+  }
+  const header = parseHeaderLine(decoder.decode(probe.subarray(headerStart, headerEnd)));
   const dataStart = headerEnd + 1;
 
-  const rowEnd = probe.indexOf(10, dataStart);
+  const rowEnd = probe.indexOf(NEWLINE, dataStart);
   if (rowEnd < 0) throw new Error(`${file.name}: header but no data rows.`);
   const firstRow = decoder.decode(probe.subarray(dataStart, rowEnd));
 
@@ -109,77 +149,50 @@ export async function readCasePlan(file: File): Promise<CasePlan> {
     throw new Error(`${file.name}: could not read a year from the first Date field.`);
   }
 
-  return {
-    file,
-    header,
-    dataStart,
-    year,
-    bytesPerRow: rowEnd - dataStart + 1,
-    areas: readAreaAxis(file.name, decoder.decode(probe.subarray(dataStart)), header.nameCol),
-  };
+  return { file, header, title, dataStart, year, bytesPerRow: rowEnd - dataStart + 1 };
 }
 
-/**
- * The area axis, read from the file rather than shipped with the app.
- *
- * An export is ordered (date, hour, area) with every area present in every
- * hour -- the same assumption block sizing already makes (`hourBytes =
- * bytesPerRow * SLAB_AREAS`). So the first hour's rows ARE the axis, in the
- * order the cube indexes them: read Name until it repeats.
- */
-function readAreaAxis(filename: string, body: string, nameCol: number): string[] {
-  const seen = new Set<string>();
-  const areas: string[] = [];
-  let start = 0;
-  while (start < body.length) {
-    const end = body.indexOf('\n', start);
-    if (end < 0) break; // a partial row at the end of the probe
-    const name = body.slice(start, end).split(',')[nameCol]?.trim();
-    start = end + 1;
-    if (!name) continue;
-    if (seen.has(name)) return areas; // second hour: the axis is complete
-    seen.add(name);
-    areas.push(name);
-  }
-  if (areas.length === 0) throw new Error(`${filename}: no area names in the first rows.`);
-  throw new Error(
-    `${filename}: read ${areas.length} distinct area names in the first ` +
-      `${HEAD_PROBE_BYTES / 1024} KB without one repeating, so the area axis could not be ` +
-      'established. An export must list every area in every hour.',
-  );
-}
-
+/** Every interface any dropped file carries, in first-seen order (D14). */
 export function unionOf(plans: CasePlan[]): string[] {
-  const columns = unionSchema(plans.map((p) => p.header));
-  // Calculated columns are in no file's header, so they are appended here or
-  // the picker never offers them.
-  return [...columns, ...derivedFor(columns)];
+  return unionSchema(plans.map((p) => p.header));
+}
+
+/** Which of `plans` carries each interface -- what the picker shows next to a
+ * column that only some files have. */
+export function coverageOf(plans: CasePlan[]): Map<string, string[]> {
+  const coverage = new Map<string, string[]>();
+  for (const plan of plans) {
+    const name = caseNameOf(plan.file.name);
+    for (const column of plan.header.interfaceNames) {
+      const seen = coverage.get(column);
+      if (seen) seen.push(name);
+      else coverage.set(column, [name]);
+    }
+  }
+  return coverage;
 }
 
 // ---------------------------------------------------------------- the pool
 
 let poolPromise: Promise<Worker[]> | null = null;
-/** The axis the workers' hash tables were built from, joined. */
-let poolAxis = '';
 
 function poolSize(): number {
   const cores = typeof navigator === 'undefined' ? 4 : (navigator.hardwareConcurrency ?? 4);
   return Math.max(1, Math.min(cores, 8));
 }
 
-async function createPool(areas: string[]): Promise<Worker[]> {
+async function createPool(): Promise<Worker[]> {
   if (!hasSimd()) throw new Error(NO_SIMD_MESSAGE);
 
   // Compiled once on the main thread and cloned to every worker: a
   // WebAssembly.Module is structured-cloneable, so N workers cost one fetch
   // and one compile rather than N of each.
   const module = await WebAssembly.compileStreaming(fetch('./block.wasm'));
-  const hashes = areaHashes(areas);
 
   const workers: Worker[] = [];
   for (let i = 0; i < poolSize(); i++) {
     const worker = new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' });
-    const init: InitMessage = { kind: 'init', module, areaHashes: hashes };
+    const init: InitMessage = { kind: 'init', module };
     await new Promise<void>((resolve, reject) => {
       const handler = (event: MessageEvent<WorkerResponse>) => {
         worker.removeEventListener('message', handler);
@@ -191,20 +204,21 @@ async function createPool(areas: string[]): Promise<Worker[]> {
     });
     workers.push(worker);
   }
-  poolAxis = areas.join(',');
   return workers;
 }
 
 /**
- * The pool, built for this area axis. The workers hold a hash table of area
- * names; a file whose axis differs routes its rows into the wrong cube planes
- * unless they are rebuilt, so a changed axis takes the pool down with it.
+ * The pool. Workers hold no per-study state at all now that interfaces are
+ * columns -- a plane is located by the JS-side column plan, not by a hash
+ * table inside the module -- so one pool serves every file for the life of
+ * the page and can be warmed before anything is dropped.
  */
-function poolFor(areas: string[]): Promise<Worker[]> {
-  if (poolPromise && poolAxis === areas.join(',')) return poolPromise;
-  const dying = poolPromise;
-  void dying?.then((workers) => workers.forEach((worker) => worker.terminate())).catch(() => {});
-  poolPromise = createPool(areas);
+export function warmPool(): void {
+  if (!poolPromise && hasSimd()) poolPromise = createPool();
+}
+
+function pool(): Promise<Worker[]> {
+  if (!poolPromise) poolPromise = createPool();
   return poolPromise;
 }
 
@@ -229,28 +243,38 @@ export interface CaseAccumulator {
   cube: Float32Array;
   /** Per-hour TOU code, 0xFF until a row covers the hour. */
   tou: Uint8Array;
-  areaSeen: Uint8Array;
   hourSeen: Uint8Array;
+  /** Feb 29 rows the parser dropped (D4). */
+  feb29: number;
 }
 
 export function createAccumulator(plan: ColumnPlan): CaseAccumulator {
-  const cube = new Float32Array(SLAB_AREAS * plan.metrics.length * HOURS_PER_YEAR);
+  const cube = new Float32Array(plan.interfaces.length * HOURS_PER_YEAR);
   // See the header comment: NaN, not zero, is the correct "no data here".
   cube.fill(NaN);
   return {
     plan,
     cube,
     tou: new Uint8Array(HOURS_PER_YEAR).fill(0xff),
-    areaSeen: new Uint8Array(SLAB_AREAS),
     hourSeen: new Uint8Array(HOURS_PER_YEAR),
+    feb29: 0,
   };
 }
 
-/** Blit one block's slab into the cube at its own hour offset. Blocks are
- * position-independent, so this is correct in any arrival order. */
+/**
+ * Blit one block's slab into the cube at its own hour offset. Blocks are
+ * position-independent, so this is correct in any arrival order.
+ *
+ * One row is one whole hour in this format, and a block is widened to whole
+ * rows before it is parsed, so no hour is ever split between two blocks and
+ * this is a straight copy per plane. The area-export version of this function
+ * had to merge the two edge hours by hand; that whole class of bug is gone
+ * with the area column (D13).
+ */
 export function blitBlock(accumulator: CaseAccumulator, block: BlockPayload): void {
   const { plan, cube } = accumulator;
   const { baseHour, hours, data } = block;
+  accumulator.feb29 += block.feb29;
   if (hours === 0) return;
   if (baseHour + hours > HOURS_PER_YEAR) {
     throw new Error(
@@ -259,32 +283,9 @@ export function blitBlock(accumulator: CaseAccumulator, block: BlockPayload): vo
     );
   }
 
-  // Block boundaries land mid-row, so a block routinely starts partway
-  // through an hour's 43 area-rows and ends partway through another. Those
-  // two hours are NaN in this block's slab for the areas the neighbouring
-  // block owns, and a straight copy would overwrite good values with NaN.
-  //
-  // Rows are area-fastest within (date, hour) and a block is a contiguous
-  // row range, so only the FIRST and LAST hour can ever be partial: every
-  // hour in between has all 43 of its rows inside this block. Copy the
-  // interior with one memcpy per (plane, area) and NaN-skip only the two
-  // edges.
-  const numMetrics = plan.metrics.length;
   for (let p = 0; p < plan.activePlanes.length; p++) {
-    const metric = plan.slabPlan[plan.activePlanes[p]];
-    for (let area = 0; area < SLAB_AREAS; area++) {
-      const src = (p * SLAB_AREAS + area) * hours;
-      const dst = (area * numMetrics + metric) * HOURS_PER_YEAR + baseHour;
-
-      if (hours >= 3) cube.set(data.subarray(src + 1, src + hours - 1), dst + 1);
-
-      const first = data[src];
-      if (!Number.isNaN(first)) cube[dst] = first;
-      if (hours > 1) {
-        const last = data[src + hours - 1];
-        if (!Number.isNaN(last)) cube[dst + hours - 1] = last;
-      }
-    }
+    const column = plan.slabPlan[plan.activePlanes[p]];
+    cube.set(data.subarray(p * hours, (p + 1) * hours), column * HOURS_PER_YEAR + baseHour);
   }
 
   for (let t = 0; t < hours; t++) {
@@ -293,101 +294,6 @@ export function blitBlock(accumulator: CaseAccumulator, block: BlockPayload): vo
     accumulator.tou[baseHour + t] = code;
     accumulator.hourSeen[baseHour + t] = 1;
   }
-  for (let area = 0; area < SLAB_AREAS; area++) {
-    if (block.areaSeen[area]) accumulator.areaSeen[area] = 1;
-  }
-}
-
-/**
- * Fill every CALCULATED column's plane from its operands, after the last block
- * has blitted. NaN propagates on its own -- an hour either operand never
- * covered stays absent rather than becoming a plausible zero.
- *
- * Per-area subtraction is sound only because both operands are same-unit
- * EXTENSIVE (see ColumnRule.derived). A per-area RATIO (`op: 'div'`) is only a
- * per-area answer; what makes it right for a grouping is the WEIGHTED_MEAN
- * rule weighted by its denominator, applied after the collapse in kernels.ts.
- * Presence follows the operands either way: a calculated column whose inputs
- * were not retained has no plane to build and stays absent, which is what the
- * pane then refuses on.
- *
- * Returns warnings about operand SIGN (the one thing about a subtraction the
- * schema cannot establish) and about zero denominators.
- */
-export function applyDerived(accumulator: CaseAccumulator): string[] {
-  const { plan, cube } = accumulator;
-  const numMetrics = plan.metrics.length;
-  const warnings: string[] = [];
-
-  for (let metric = 0; metric < numMetrics; metric++) {
-    const derived = ruleFor(plan.metrics[metric])?.derived;
-    if (!derived) continue;
-    const left = plan.metrics.indexOf(derived.minuend);
-    const right = plan.metrics.indexOf(derived.subtrahend);
-    if (left < 0 || right < 0 || !plan.presence[left] || !plan.presence[right]) continue;
-
-    // A subtraction only means what the column's NAME claims if both operands
-    // are unsigned magnitudes. `Net Interchange` = Import - Export is net
-    // imports only while Export is stored positive; if an export ever ships
-    // its flows as negatives, the same subtraction silently becomes a sum of
-    // magnitudes. The sign is data, so it is checked rather than assumed.
-    let negativeLeft = 0;
-    let negativeRight = 0;
-    let zeroDenominator = 0;
-    let live = 0;
-    const divide = derived.op === 'div';
-
-    for (let area = 0; area < SLAB_AREAS; area++) {
-      const out = (area * numMetrics + metric) * HOURS_PER_YEAR;
-      const a = (area * numMetrics + left) * HOURS_PER_YEAR;
-      const b = (area * numMetrics + right) * HOURS_PER_YEAR;
-      for (let hour = 0; hour < HOURS_PER_YEAR; hour++) {
-        const x = cube[a + hour];
-        const y = cube[b + hour];
-        // A zero denominator is undefined, not infinite: x/0 would put
-        // Infinity in the cube, which every downstream kernel treats as a
-        // number and no NaN guard catches (footgun 21). Absent is the honest
-        // read -- an area with no installed capacity has no capacity factor.
-        cube[out + hour] = divide ? (y === 0 ? NaN : x / y) : x - y;
-        if (Number.isNaN(x) || Number.isNaN(y)) continue;
-        live++;
-        if (x < 0) negativeLeft++;
-        if (y < 0) negativeRight++;
-        if (y === 0) zeroDenominator++;
-      }
-    }
-    plan.presence[metric] = 1;
-
-    if (divide) {
-      if (zeroDenominator > 0) {
-        warnings.push(
-          `"${plan.metrics[metric]}" has ${zeroDenominator.toLocaleString()} area-hour(s) where ` +
-            `${derived.subtrahend} is zero; those read as no-data rather than as a ratio.`,
-        );
-      }
-      // The sign guard below is about what a SUBTRACTION means. A ratio's
-      // equivalent question is answered by the weight pairing, which
-      // test_kernels.mjs asserts against the rule table.
-      continue;
-    }
-
-    // A tenth, not one cell: a few negatives are ordinary (solver noise, a
-    // genuinely negative net position), a systematically signed column is not.
-    const threshold = live / 10;
-    const signed = [
-      negativeLeft > threshold ? derived.minuend : null,
-      negativeRight > threshold ? derived.subtrahend : null,
-    ].filter((name): name is string => name !== null);
-    if (signed.length > 0) {
-      warnings.push(
-        `"${plan.metrics[metric]}" subtracts ${derived.subtrahend} from ${derived.minuend}, ` +
-          `but ${signed.join(' and ')} ${signed.length === 1 ? 'carries' : 'carry'} negative ` +
-          `values in this export — so the result is not the net figure the name implies. ` +
-          `Check the export's sign convention before reading it.`,
-      );
-    }
-  }
-  return warnings;
 }
 
 export function finalizeCase(
@@ -395,29 +301,17 @@ export function finalizeCase(
   name: string,
   sourceColumns: string[],
   year: number,
-  areas: string[],
+  title: TitleInfo,
 ): { data: CaseData; warnings: string[] } {
   const { plan, cube } = accumulator;
-  const numMetrics = plan.metrics.length;
-  const presence = new Uint8Array(SLAB_AREAS * numMetrics);
-  for (let area = 0; area < SLAB_AREAS; area++) {
-    if (!accumulator.areaSeen[area]) continue;
-    for (let metric = 0; metric < numMetrics; metric++) {
-      presence[area * numMetrics + metric] = plan.presence[metric];
-    }
-  }
-
   const warnings: string[] = [];
-  const absentMetrics = plan.metrics.filter((_, i) => !plan.presence[i]);
-  if (absentMetrics.length > 0) {
+
+  const absent = plan.interfaces.filter((_, i) => !plan.presence[i]);
+  if (absent.length > 0) {
     warnings.push(
-      `${name}: ${absentMetrics.length} retained column(s) are not in this export ` +
-        `(${absentMetrics.slice(0, 3).join(', ')}${absentMetrics.length > 3 ? ', …' : ''}).`,
+      `${name}: ${absent.length} selected interface(s) are not in this export ` +
+        `(${absent.slice(0, 3).join(', ')}${absent.length > 3 ? ', …' : ''}).`,
     );
-  }
-  const missingAreas = areas.filter((_, i) => !accumulator.areaSeen[i]);
-  if (missingAreas.length > 0) {
-    warnings.push(`${name}: no rows for ${missingAreas.length} area(s): ${missingAreas.join(', ')}.`);
   }
   let covered = 0;
   for (let h = 0; h < HOURS_PER_YEAR; h++) covered += accumulator.hourSeen[h];
@@ -428,20 +322,36 @@ export function finalizeCase(
     );
   }
   // D4, and it must be stated rather than silent.
-  if ((year % 4 === 0 && year % 100 !== 0) || year % 400 === 0) {
-    warnings.push(`${name}: ${year} is a leap year — Feb 29 was dropped at ingest (D4).`);
+  if (accumulator.feb29 > 0) {
+    warnings.push(
+      `${name}: ${year} is a leap year — ${accumulator.feb29.toLocaleString()} Feb 29 row(s) ` +
+        `were dropped at ingest so every case is exactly ${HOURS_PER_YEAR.toLocaleString()} ` +
+        `hours (D4).`,
+    );
+  }
+  if (title.quantity === '') {
+    warnings.push(
+      `${name}: the title line does not name a quantity, so this case has no unit. Its ` +
+        `series still plot, on an axis of their own.`,
+    );
+  } else if (title.year !== null && title.year !== year) {
+    warnings.push(
+      `${name}: the title line says year ${title.year} but the first data row is ${year}. ` +
+        `The data rows win.`,
+    );
   }
 
   return {
     data: {
       name,
       cube,
-      areas,
-      metrics: plan.metrics,
-      presence,
+      interfaces: plan.interfaces,
+      presence: plan.presence.slice(),
       tou: accumulator.tou,
       sourceColumns,
       year,
+      quantity: title.quantity,
+      unit: unitOf(title.quantity),
     },
     warnings,
   };
@@ -456,12 +366,11 @@ function blocksFor(
   nextId: () => number,
 ): BlockMessage[] {
   // A block must never span more hours than block.c's slab window, and row
-  // length varies 20x between a 5-column sample and the 54-column export, so
-  // the bound comes from this file's own rows rather than a constant.
-  const hourBytes = plan.bytesPerRow * SLAB_AREAS;
+  // length varies with the number of interfaces the export monitors, so the
+  // bound comes from this file's own rows rather than a constant.
   const blockBytes = Math.max(
-    plan.bytesPerRow * SLAB_AREAS,
-    Math.min(BLOCK_TARGET_BYTES, SAFE_BLOCK_HOURS * hourBytes),
+    plan.bytesPerRow,
+    Math.min(BLOCK_TARGET_BYTES, SAFE_BLOCK_HOURS * plan.bytesPerRow),
   );
 
   const jobs: BlockMessage[] = [];
@@ -481,9 +390,13 @@ function blocksFor(
 }
 
 /**
- * Parse every plan into its own cube. `retained` defines the cube's metric
+ * Parse every plan into its own cube. `retained` defines the cube's interface
  * axis; the caller gets it from the picker, or passes the union schema for
  * "everything".
+ *
+ * Files need not agree on their columns: the axis is the union and each case
+ * carries a presence bitmap, so a path monitored in one run and not another
+ * loads as absent in that case rather than refusing the drop (D14).
  */
 export async function ingest(
   plans: CasePlan[],
@@ -492,43 +405,13 @@ export async function ingest(
 ): Promise<IngestResult> {
   if (plans.length === 0) return { cases: [], warnings: [] };
 
-  // The axis comes from the files themselves. Every case in one drop has to
-  // agree on it, because one cube layout is shared by all of them and an area
-  // index means the same thing in each.
-  const areas = plans[0].areas;
-  if (areas.length !== SLAB_AREAS) {
-    throw new Error(
-      `${plans[0].file.name} has ${areas.length} areas per hour but parser/block.c is built ` +
-        `for ${SLAB_AREAS}. Rebuild the parser with a matching NUM_AREAS.`,
-    );
+  const interfaces = retained.map((name) => name.trim());
+  if (interfaces.length === 0) {
+    throw new Error('No interfaces selected — there would be nothing to plot.');
   }
-  for (const plan of plans.slice(1)) {
-    if (plan.areas.join(',') !== areas.join(',')) {
-      throw new Error(
-        `${plan.file.name} lists a different set or order of areas than ` +
-          `${plans[0].file.name}. Load exports that share an area axis, or load them ` +
-          'separately.',
-      );
-    }
-  }
-
-  // Exactly the columns that were picked. A weight the selection needs but
-  // does not include is reported, not smuggled in: the multi-area series that
-  // depends on it refuses to draw later (footgun 20), which is the honest
-  // outcome of the choice rather than a silent 35 MB per case per column.
-  const metrics = retained.map((name) => name.trim());
   const warnings: string[] = [];
-  const kept = new Set(metrics);
-  for (const name of requiredInputs(metrics)) {
-    if (kept.has(name)) continue;
-    warnings.push(
-      `"${name}" was not retained. Columns weighted by it can only be plotted for a single ` +
-        `area, and calculated columns that subtract it cannot be built at all. Re-ingest ` +
-        `with it kept.`,
-    );
-  }
 
-  const columnPlans = plans.map((plan) => buildColumnPlan(plan.header, metrics));
+  const columnPlans = plans.map((plan) => buildColumnPlan(plan.header, interfaces));
   const accumulators = columnPlans.map(createAccumulator);
 
   let id = 0;
@@ -537,7 +420,7 @@ export async function ingest(
     jobs.push(...blocksFor(plan, index, columnPlans[index].activePlanes, () => id++));
   });
 
-  const workers = await poolFor(areas);
+  const workers = await pool();
   let done = 0;
   let next = 0;
   await Promise.all(
@@ -556,20 +439,22 @@ export async function ingest(
   const cases: CaseData[] = [];
   accumulators.forEach((accumulator, index) => {
     const plan = plans[index];
-    // After every block, before presence is read: a calculated column's plane
-    // needs its operands complete across the whole year, and finalizeCase is
-    // what turns plan.presence into the per-(area, metric) bitmap.
-    warnings.push(...applyDerived(accumulator));
     const finalized = finalizeCase(
       accumulator,
-      plan.file.name,
-      plan.header.metricNames,
+      caseNameOf(plan.file.name),
+      plan.header.interfaceNames,
       plan.year,
-      areas,
+      plan.title,
     );
     cases.push(finalized.data);
     warnings.push(...finalized.warnings);
   });
 
   return { cases, warnings };
+}
+
+/** Bytes one case's cube occupies, for the picker's readout. Exact, not an
+ * estimate: this is the allocation createAccumulator makes. */
+export function cubeBytesFor(interfaceCount: number): number {
+  return interfaceCount * HOURS_PER_YEAR * Float32Array.BYTES_PER_ELEMENT;
 }

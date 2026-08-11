@@ -5,12 +5,12 @@
 // There is no framework and no store (D12). Every interaction builds a new
 // frozen Query and calls render(), which recomputes from the cubes and
 // pushes the result into the rail and the four panes. That is viable
-// because the arithmetic is cheap: re-filtering measures 0.055 ms and the
-// 10-case duration curve 14 ms, against 100 ms and 250 ms gates.
+// because the arithmetic is cheap: a series is one stored plane, and
+// re-filtering and re-sorting it costs well under the interaction gates.
 //
-// Buffers are allocated once per case and reused. Sorting is the only real
-// cost in an interaction (footgun 14), and allocating a scratch array inside
-// a render path is how that cost gets multiplied for no reason.
+// Buffers are allocated once per drawn line and reused. Sorting is the only
+// real cost in an interaction (footgun 14), and allocating a scratch array
+// inside a render path is how that cost gets multiplied for no reason.
 
 import './styles.css';
 import {
@@ -26,33 +26,24 @@ import {
   SEASON_NAMES,
 } from './calendar';
 import {
-  ALL_AREAS,
-  allAreas,
-  exportGroupings,
-  groupingNames,
-  isOffAxis,
-  setAxis,
-  setGroupings,
-  type GroupingSummary,
-} from './groupings';
-import {
   applyMask,
   buildSeries,
   createScratch,
   hasData,
   isAllZero,
-  pooledWeightedMean,
   quantiles,
   stats,
   type Quantiles,
 } from './kernels';
-import { ruleFor } from './rules';
 import {
+  caseNameOf,
+  coverageOf,
   hasSimd,
   ingest,
   NO_SIMD_MESSAGE,
   readCasePlan,
   unionOf,
+  warmPool,
   type CasePlan,
 } from './ingest/pool';
 import {
@@ -64,11 +55,10 @@ import {
   saveBundle,
   warmStorage,
 } from './storage';
-import type { BoxDim, CaseData, Filters, Query, Selection } from './types';
+import type { BoxDim, CaseData, Filters, Query } from './types';
 import { createCharts, type BoxGroup, type CaseSeries } from './ui/charts';
-import { showGroupEditor } from './ui/groups';
 import { showPicker } from './ui/picker';
-import { areasFor, CASE_COLORS, createShell } from './ui/shell';
+import { CASE_COLORS, createShell } from './ui/shell';
 
 // ---------------------------------------------------------------- state
 
@@ -80,29 +70,22 @@ interface CaseBuffers {
   mask: Uint8Array;
   /** Kept values, gathered then sorted in place. */
   gathered: Float32Array;
-  /** Per-hour weight sum, for WEIGHTED_MEAN columns. */
-  weights: Float32Array;
 }
 
 const cases: CaseData[] = [];
 const buffers = new Map<string, CaseBuffers>();
 /** Reused by every box-plot partition; one box is consumed before the next,
- * so two buffers cover the whole pane no matter how many boxes it draws. */
+ * so one buffer covers the whole pane no matter how many boxes it draws. */
 const boxScratch = createScratch();
-const boxSeriesScratch = createScratch();
-const boxWeightsScratch = createScratch();
 let notes: string[] = [];
 let busy: string | null = null;
 
 let query: Query = Object.freeze({
   cases: [] as readonly string[],
-  // Empty until a file says what columns exist; render() adopts the first
-  // available metric. Naming one here would be this app asserting what a
-  // utility's export contains.
-  metrics: [] as readonly string[],
-  selections: [
-    Object.freeze({ kind: 'grouping' as const, name: groupingNames()[0] ?? ALL_AREAS }),
-  ] as readonly Selection[],
+  // Empty until a file says which interfaces exist; render() adopts the first
+  // available one. Naming a path here would be this app asserting what a
+  // utility monitors.
+  interfaces: [] as readonly string[],
   filters: Object.freeze({
     months: null,
     hoursOfDay: null,
@@ -122,11 +105,11 @@ function setFilters(patch: Partial<Filters>): void {
   setQuery({ filters: Object.freeze({ ...query.filters, ...patch }) });
 }
 
-/** Buffers are per drawn line, not per case: two metrics of the same case are
- * two series and each needs its own display and sorted arrays to survive
- * until the panes read them. ~175 KB each, ten lines maximum. */
+/** Buffers are per drawn line: two interfaces of the same case are two series
+ * and each needs its own display and sorted arrays to survive until the panes
+ * read them. ~140 KB each, ten lines maximum. */
 function buffersFor(key: SeriesKey): CaseBuffers {
-  const id = `${key.data.name}\u0000${key.selection.kind}:${key.selection.name}\u0000${key.metric}`;
+  const id = `${key.data.name}\u0000${key.interfaceName}`;
   let existing = buffers.get(id);
   if (!existing) {
     existing = {
@@ -134,25 +117,40 @@ function buffersFor(key: SeriesKey): CaseBuffers {
       display: createScratch(),
       mask: new Uint8Array(HOURS_PER_YEAR),
       gathered: createScratch(),
-      weights: createScratch(),
     };
     buffers.set(id, existing);
   }
   return existing;
 }
 
-/** The metric axis offered in the rail: every column any loaded case kept. */
-function availableMetrics(): string[] {
+/** The interface axis offered in the rail: every path any loaded case kept. */
+function availableInterfaces(): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
   for (const data of cases) {
-    for (const metric of data.metrics) {
-      if (seen.has(metric)) continue;
-      seen.add(metric);
-      out.push(metric);
+    for (const name of data.interfaces) {
+      if (seen.has(name)) continue;
+      seen.add(name);
+      out.push(name);
     }
   }
   return out;
+}
+
+/** Interface -> the loaded cases that actually carry data for it. Drives the
+ * rail's "in 1 of 2 cases" hint, so it reads presence and not just the axis:
+ * a case can hold a column that this export never monitored (D14). */
+function coverageOfCases(): Map<string, string[]> {
+  const coverage = new Map<string, string[]>();
+  for (const data of cases) {
+    data.interfaces.forEach((name, index) => {
+      if (!hasData(data, index)) return;
+      const seen = coverage.get(name);
+      if (seen) seen.push(data.name);
+      else coverage.set(name, [data.name]);
+    });
+  }
+  return coverage;
 }
 
 // ---------------------------------------------------------------- render
@@ -164,8 +162,9 @@ function availableMetrics(): string[] {
  * about what "key" means (1-based for month and hour-ending, 0-based for day
  * and season), and two switches are two places for that to drift.
  *
- * 'case' and 'area' are absent on purpose: they partition by something that
- * is not in the calendar, and computeBoxes handles each before it gets here.
+ * 'case' and 'interface' are absent on purpose: they partition by something
+ * that is not in the calendar, and computeBoxes handles each before it gets
+ * here.
  */
 const BOX_DIMS: Partial<
   Record<BoxDim, { keys: { key: number; label: string }[]; of: (entry: number) => number }>
@@ -175,8 +174,8 @@ const BOX_DIMS: Partial<
     keys: Array.from({ length: 24 }, (_, i) => ({ key: i + 1, label: String(i + 1) })),
     of: getHourOfDay,
   },
-  dayOfWeek: { keys: DAY_NAMES.map((label, i) => ({ key: i, label })), of: getDayOfWeek },
-  season: { keys: SEASON_NAMES.map((label, i) => ({ key: i, label })), of: getSeason },
+  dayOfWeek: { keys: DAY_NAMES.map((label, index) => ({ key: index, label })), of: getDayOfWeek },
+  season: { keys: SEASON_NAMES.map((label, index) => ({ key: index, label })), of: getSeason },
 };
 
 /**
@@ -184,7 +183,7 @@ const BOX_DIMS: Partial<
  * sum(n_i log n_i) <= N log N -- strictly less than the duration curve's
  * single sort of the same points. No dimension needs a precompute (D8).
  */
-function computeBoxes(series: CaseSeries[]): BoxGroup[] {
+function computeBoxes(keys: SeriesKey[], series: CaseSeries[]): BoxGroup[] {
   const dim = query.boxDim;
   const drawable = series.filter((entry) => entry.values !== null);
 
@@ -197,44 +196,27 @@ function computeBoxes(series: CaseSeries[]): BoxGroup[] {
     }));
   }
 
-  if (dim === 'area') {
-    // One group per area of the union, each holding a box per drawn line that
-    // covers that area.
-    const areas = Array.from(new Set(query.selections.flatMap((s) => areasFor(s))));
-    const keys = seriesKeys(cases.filter((data) => query.cases.includes(data.name)));
-    return areas.map((area) => ({
-      label: area,
+  if (dim === 'interface') {
+    // One group per selected interface, each holding a box per case that
+    // carries it.
+    return query.interfaces.map((name) => ({
+      label: name,
       boxes: keys.flatMap((key, index) => {
         const entry = series[index];
-        if (!entry || entry.values === null) return [];
-        const built = buildSeries(
-          key.data,
-          key.metric,
-          [area],
-          boxSeriesScratch,
-          boxWeightsScratch,
-        );
-        if (built.values === null) return [];
-        const buffer = buffersFor(key);
-        const n = applyMask(built.values, buffer.mask, boxScratch);
+        if (key.interfaceName !== name || !entry || entry.values === null) return [];
         return [
-          {
-            color: entry.color,
-            name: entry.name,
-            unit: entry.unit,
-            quantiles: quantiles(boxScratch, n),
-          },
+          { color: entry.color, name: entry.name, unit: entry.unit, quantiles: entry.quantiles },
         ];
       }),
     }));
   }
 
-  // 'case' and 'area' returned above, so anything left is a calendar dimension.
+  // 'case' and 'interface' returned above, so anything left is a calendar
+  // dimension.
   const partition = BOX_DIMS[dim];
   if (!partition) return [];
 
   const calendars = new Map<number, Uint32Array>();
-  const keys = seriesKeys(cases.filter((data) => query.cases.includes(data.name)));
   const groups: BoxGroup[] = [];
   for (const category of partition.keys) {
     const boxes: { color: string; name: string; unit: string; quantiles: Quantiles }[] = [];
@@ -267,47 +249,42 @@ function computeBoxes(series: CaseSeries[]): BoxGroup[] {
   return groups;
 }
 
-/** One drawn line: a (case, selection, metric) triple. */
+/** One drawn line: a (case, interface) pair. */
 interface SeriesKey {
   data: CaseData;
-  selection: Selection;
-  metric: string;
+  interfaceName: string;
 }
 
 /** The cross product, in a stable order: case outermost so a case's lines stay
- * together in the legend, then selection, then metric. */
+ * together in the legend, then interface. */
 function seriesKeys(active: CaseData[]): SeriesKey[] {
   const keys: SeriesKey[] = [];
   for (const data of active) {
-    for (const selection of query.selections) {
-      for (const metric of query.metrics) keys.push({ data, selection, metric });
-    }
+    for (const interfaceName of query.interfaces) keys.push({ data, interfaceName });
   }
   return keys;
 }
 
 /**
- * Label for one line. The case is always named; the other two axes are named
- * only when more than one of them is drawn, because "Case1 · AREA01 · Load
- * (MWh)" on a chart that has exactly one area and one metric is three words
- * of noise on every row of the legend.
+ * Label for one line. The case is always named; the interface only when more
+ * than one is drawn, because "01_PF · P84 Harry Allen–Eldorado 500 kV N-S" on
+ * a chart that has exactly one path is half a legend row of noise.
  */
 function seriesLabel(key: SeriesKey): string {
-  const parts = [key.data.name];
-  if (query.selections.length > 1) parts.push(key.selection.name);
-  if (query.metrics.length > 1) parts.push(key.metric);
-  return parts.join(' · ');
+  return query.interfaces.length > 1 ? `${key.data.name} · ${key.interfaceName}` : key.data.name;
 }
 
 function render(): void {
-  const metrics = availableMetrics();
-  // Metrics that no loaded case carries would draw nothing and say nothing.
-  // An empty set adopts the first column the data turned out to have, which
-  // is also how the very first load picks a metric at all.
-  if (metrics.length > 0) {
-    const kept = query.metrics.filter((metric) => metrics.includes(metric));
-    if (kept.length === 0) query = Object.freeze({ ...query, metrics: [metrics[0]] });
-    else if (kept.length !== query.metrics.length) query = Object.freeze({ ...query, metrics: kept });
+  const available = availableInterfaces();
+  // Interfaces no loaded case carries would draw nothing and say nothing. An
+  // empty set adopts the first path the data turned out to have, which is
+  // also how the very first load picks one at all.
+  if (available.length > 0) {
+    const kept = query.interfaces.filter((name) => available.includes(name));
+    if (kept.length === 0) query = Object.freeze({ ...query, interfaces: [available[0]] });
+    else if (kept.length !== query.interfaces.length) {
+      query = Object.freeze({ ...query, interfaces: kept });
+    }
   }
 
   const enabled = new Set(query.cases);
@@ -317,35 +294,34 @@ function render(): void {
   const series: CaseSeries[] = [];
   let keptHours = 0;
 
-  // Ten colours, ten lines (GUI decision 5: the mapping has to be learnable).
-  // The cross product blows past that quickly -- 3 cases x 2 areas x 2 metrics
-  // is already 12 -- so it is capped here rather than drawn illegibly.
+  // Ten colours, ten lines: the mapping has to be learnable. The cross
+  // product blows past that quickly -- 3 cases x 4 interfaces is already 12 --
+  // so it is capped here rather than drawn illegibly.
   const overflow = keys.length > CASE_COLORS.length;
 
   keys.forEach((key, index) => {
     if (overflow) return;
-    const { data, selection, metric } = key;
+    const { data, interfaceName } = key;
     const color = CASE_COLORS[index % CASE_COLORS.length];
     const buffer = buffersFor(key);
-    const rule = ruleFor(metric);
 
     buildMask(query.filters, buildCalendar(data.year), data.tou, buffer.mask);
 
-    const built = buildSeries(data, metric, areasFor(selection), buffer.series, buffer.weights);
+    const built = buildSeries(data, interfaceName, buffer.series);
     if (built.values === null) {
       series.push({
         name: seriesLabel(key),
+        detail: `${data.name} · ${interfaceName}`,
         color,
-        unit: rule?.unit ?? '',
-        metric,
+        unit: data.unit,
+        quantity: data.quantity,
         values: null,
         refusal: built.refusal,
         warnings: built.warnings,
         sorted: buffer.gathered,
         n: 0,
-        stats: { n: 0, mean: NaN, min: NaN, max: NaN, sd: NaN },
+        stats: { n: 0, mean: NaN, min: NaN, max: NaN, sd: NaN, sum: NaN },
         quantiles: quantiles(buffer.gathered, 0),
-        pooled: null,
         allZero: false,
       });
       return;
@@ -371,20 +347,16 @@ function render(): void {
 
     series.push({
       name: seriesLabel(key),
+      detail: `${data.name} · ${interfaceName}`,
       color,
-      unit: rule?.unit ?? '',
-      metric,
+      unit: data.unit,
+      quantity: data.quantity,
       values: buffer.display,
       warnings: built.warnings,
-      weightColumn: built.weightColumn,
       sorted: buffer.gathered,
       n,
       stats: summary,
       quantiles: spread,
-      pooled:
-        built.weights !== undefined
-          ? pooledWeightedMean(built.values, built.weights, buffer.mask)
-          : null,
       allZero,
     });
   });
@@ -392,17 +364,16 @@ function render(): void {
   const paneNotes = [...notes, ...series.flatMap((entry) => entry.warnings)];
   if (overflow) {
     paneNotes.unshift(
-      `${keys.length} series selected (${active.length} case(s) x ${query.selections.length} ` +
-        `area(s) x ${query.metrics.length} metric(s)). ${CASE_COLORS.length} is the most that ` +
-        'can be told apart by colour — narrow one of the three.',
+      `${keys.length} series selected (${active.length} case(s) × ${query.interfaces.length} ` +
+        `interface(s)). ${CASE_COLORS.length} is the most that can be told apart by colour — ` +
+        'narrow one of the two.',
     );
   }
 
   charts.render({
     query,
-    weighted: series.some((entry) => entry.weightColumn !== undefined),
     series,
-    boxes: computeBoxes(series),
+    boxes: computeBoxes(keys, series),
     notes: paneNotes,
     refusal: overflow ? paneNotes[0] : undefined,
   });
@@ -410,7 +381,8 @@ function render(): void {
   shell.render(query, {
     cases,
     enabled,
-    metrics,
+    interfaces: available,
+    coverage: coverageOfCases(),
     legend: series.map((entry) => ({ label: entry.name, color: entry.color })),
     keptHours: active.length === 0 ? HOURS_PER_YEAR : keptHours,
     bytes: cases.reduce((total, data) => total + data.cube.byteLength, 0),
@@ -423,7 +395,7 @@ function render(): void {
 const fileInput = document.createElement('input');
 fileInput.id = 'file-input';
 fileInput.type = 'file';
-fileInput.accept = '.csv,text/csv,.gvap';
+fileInput.accept = '.csv,text/csv,.gvip';
 fileInput.multiple = true;
 fileInput.style.display = 'none';
 document.body.appendChild(fileInput);
@@ -433,11 +405,11 @@ fileInput.addEventListener('change', () => {
   if (files.length > 0) void loadFiles(files);
 });
 
-// The Load button. A .gvap goes through the same routing a dropped file does,
+// The Load button. A .gvip goes through the same routing a dropped file does,
 // so restoring is one code path however the file arrives.
 const bundleInput = document.createElement('input');
 bundleInput.type = 'file';
-bundleInput.accept = '.gvap';
+bundleInput.accept = '.gvip';
 bundleInput.style.display = 'none';
 document.body.appendChild(bundleInput);
 bundleInput.addEventListener('change', () => {
@@ -451,88 +423,15 @@ function setBusy(message: string | null): void {
   render();
 }
 
-/** Group membership is many-to-many and may name areas this build does not
- * have, so what a mapping actually covers is worth stating rather than
- * leaving to be discovered as an empty chart. */
-function groupingNotes(summary: GroupingSummary, lead: string): string[] {
-  const messages = [
-    `${lead}: ${summary.groups} groups covering ${summary.mapped} of ${allAreas().length} areas.`,
-  ];
-  if (summary.offAxis.length > 0) {
-    messages.push(
-      `${summary.offAxis.length} name(s) in the mapping are not areas in this build and ` +
-        `cannot be plotted: ${summary.offAxis.join(', ')}.`,
-    );
-  }
-  if (summary.unmapped.length > 0) {
-    messages.push(`In no group: ${summary.unmapped.join(', ')}.`);
-  }
-  return messages;
-}
-
-/** Axis areas that carry data in at least one loaded case, for the editor's
- * "listed but not in the data" flag. */
-function presentAreas(): Set<string> {
-  const present = new Set<string>();
-  for (const data of cases) {
-    data.areas.forEach((area, areaIndex) => {
-      if (present.has(area)) return;
-      for (let metric = 0; metric < data.metrics.length; metric++) {
-        if (hasData(data, areaIndex, metric)) {
-          present.add(area);
-          return;
-        }
-      }
-    });
-  }
-  return present;
-}
-
-/** Groupings.csv is `Name,Grouping`; a GridView export is not. Sniffing the
- * header keeps one drop target for everything instead of asking the user
- * which kind of file they are holding. */
-async function isGroupingsCsv(file: File): Promise<boolean> {
-  const head = await file.slice(0, 200).text();
-  return /^\s*name\s*,\s*grouping\s*(\r|\n|$)/i.test(head);
-}
-
-function applyGroupings(csv: string): void {
-  const summary = setGroupings(csv);
-  notes = groupingNotes(summary, 'Groupings updated');
-
-  // Selections the new mapping does not contain would silently plot nothing,
-  // so they are dropped, and an empty result falls back to everything.
-  const names = groupingNames();
-  const kept = query.selections.filter((selection) =>
-    selection.kind === 'grouping' ? names.includes(selection.name) : !isOffAxis(selection.name),
-  );
-  if (kept.length !== query.selections.length) {
-    setQuery({ selections: kept.length > 0 ? kept : [{ kind: 'grouping', name: ALL_AREAS }] });
-  } else {
-    render();
-  }
-}
-
 async function loadFiles(files: File[]): Promise<void> {
-  // A dropped file is one of three things, told apart by its first bytes: a
-  // saved bundle, a groupings mapping, or a GridView CSV export.
+  // A dropped file is one of two things, told apart by its first bytes: a
+  // saved bundle or a GridView interface CSV export.
   const exports: File[] = [];
   for (const file of files) {
-    if (await isBundleFile(file)) {
-      await restoreBundleFile(file);
-    } else if (await isGroupingsCsv(file)) {
-      try {
-        applyGroupings(await file.text());
-      } catch (error) {
-        notes = [`${file.name}: ${error instanceof Error ? error.message : String(error)}`];
-        render();
-      }
-    } else {
-      exports.push(file);
-    }
+    if (await isBundleFile(file)) await restoreBundleFile(file);
+    else exports.push(file);
   }
   if (exports.length === 0) return;
-  files = exports;
 
   if (!hasSimd()) {
     notes = [NO_SIMD_MESSAGE];
@@ -540,25 +439,36 @@ async function loadFiles(files: File[]): Promise<void> {
     return;
   }
   try {
-    setBusy(`Reading ${files.length} header${files.length === 1 ? '' : 's'}…`);
+    setBusy(`Reading ${exports.length} header${exports.length === 1 ? '' : 's'}…`);
     const plans: CasePlan[] = [];
-    for (const file of files) plans.push(await readCasePlan(file));
+    for (const file of exports) plans.push(await readCasePlan(file));
 
-    // The area axis comes from the data. The first drop establishes it; a
-    // later drop that disagrees is refused by ingest() rather than blitted
-    // into cube planes that mean something else.
-    if (allAreas().length === 0) setAxis(plans[0].areas);
-
+    // The union of every dropped file's header, so a path monitored by only
+    // one of them can still be picked (D14).
     const union = unionOf(plans);
     // The picker is shown on the first drop only, and is skippable (D6).
-    // Later drops reuse the metric axis already in memory, because a cube
+    // Later drops reuse the interface axis already in memory, because a cube
     // with a different width could not be overlaid with the existing ones.
-    const retained = cases.length === 0 ? await showPicker(union, plans.length) : cases[0].metrics;
+    const retained =
+      cases.length === 0 ? await showPicker(union, coverageOf(plans), plans.length) : cases[0].interfaces;
 
     setBusy('Parsing…');
     const result = await ingest(plans, retained, (done, total) => {
       setBusy(`Parsing block ${done} of ${total}…`);
     });
+
+    // A path in the union that no dropped file had is impossible; a path the
+    // EXISTING cases were built with that these files lack is not, and it
+    // loads as absent. Both are reported by ingest.
+    const newColumns = union.filter((name) => !retained.includes(name));
+    if (cases.length > 0 && newColumns.length > 0) {
+      result.warnings.push(
+        `${newColumns.length} interface(s) in this drop are not on the axis the loaded cases ` +
+          `were built with and were skipped (${newColumns.slice(0, 3).join(', ')}` +
+          `${newColumns.length > 3 ? ', …' : ''}). Remove the loaded cases and re-drop ` +
+          `everything together to include them.`,
+      );
+    }
 
     for (const data of result.cases) {
       const existing = cases.findIndex((entry) => entry.name === data.name);
@@ -586,7 +496,7 @@ async function saveAll(): Promise<void> {
   }
   try {
     setBusy('Saving…');
-    // Two destinations, one button: the .gvap file is what the user keeps and
+    // Two destinations, one button: the .gvip file is what the user keeps and
     // shares, origin-private storage is what makes Load instant on this
     // machine. The file is written first, because it is the one that can be
     // cancelled at the dialog.
@@ -596,7 +506,7 @@ async function saveAll(): Promise<void> {
     await saveBundle(cases, (done, total) => setBusy(`Saving case ${done} of ${total}…`));
     notes = [
       `Saved ${cases.length} case(s) to ${filename}, and to this browser's origin-private ` +
-        `storage for the Load button. Drop the .gvap file back in to restore it anywhere.`,
+        `storage for the Load button. Drop the .gvip file back in to restore it anywhere.`,
     ];
   } catch (error) {
     notes = isAbort(error)
@@ -607,24 +517,6 @@ async function saveAll(): Promise<void> {
   }
 }
 
-/**
- * Take on the grouping mapping a bundle was saved under. Restoring a study
- * under a different mapping than it was built with plots correct numbers
- * against the wrong group names, so the bundle's mapping wins -- and says so,
- * because it also changes what the Area/Group list offers.
- */
-function adoptGroupings(csv: string | null, source: string): string[] {
-  if (csv === null) {
-    return [`${source} predates saved groupings — the mapping now loaded was left alone.`];
-  }
-  if (csv === exportGroupings()) return [];
-  try {
-    return groupingNotes(setGroupings(csv), `Groupings came from ${source}`);
-  } catch (error) {
-    return [`${source}: ${error instanceof Error ? error.message : String(error)}`];
-  }
-}
-
 async function restoreBundleFile(file: File): Promise<void> {
   try {
     setBusy(`Restoring ${file.name}…`);
@@ -632,11 +524,7 @@ async function restoreBundleFile(file: File): Promise<void> {
     cases.length = 0;
     buffers.clear();
     cases.push(...loaded.cases);
-    if (loaded.cases[0]) setAxis(loaded.cases[0].areas);
-    notes = [
-      `Restored ${loaded.cases.length} case(s) from ${file.name}.`,
-      ...adoptGroupings(loaded.groupings, file.name),
-    ];
+    notes = [`Restored ${loaded.cases.length} case(s) from ${caseNameOf(file.name)}.`];
     setQueryCases();
   } catch (error) {
     notes = [`${file.name}: ${error instanceof Error ? error.message : String(error)}`];
@@ -647,7 +535,7 @@ async function restoreBundleFile(file: File): Promise<void> {
 
 /**
  * Restore this browser's origin-private cache -- what Save wrote alongside the
- * .gvap file, and what makes Load instant on the machine the study was built
+ * .gvip file, and what makes Load instant on the machine the study was built
  * on. Rejects when there is no cache to read, which is the normal state on any
  * other machine; the caller falls back to opening a file.
  */
@@ -658,11 +546,7 @@ async function loadAll(): Promise<void> {
     cases.length = 0;
     buffers.clear();
     cases.push(...loaded.cases);
-    if (loaded.cases[0]) setAxis(loaded.cases[0].areas);
-    notes = [
-      `Loaded ${loaded.cases.length} case(s) from origin-private storage.`,
-      ...adoptGroupings(loaded.groupings, 'the saved bundle'),
-    ];
+    notes = [`Loaded ${loaded.cases.length} case(s) from origin-private storage.`];
     setQueryCases();
   } finally {
     setBusy(null);
@@ -683,9 +567,9 @@ const shell = createShell({
   onRemoveCase(name) {
     const index = cases.findIndex((data) => data.name === name);
     if (index >= 0) cases.splice(index, 1);
-    // Buffer keys are `case\0selection\0metric`, so the case name alone is
-    // never a key -- deleting it left every removed case's ~875 KB of scratch
-    // in the map for the life of the page.
+    // Buffer keys are `case\0interface`, so the case name alone is never a
+    // key -- deleting it left every removed case's scratch in the map for the
+    // life of the page.
     const prefix = `${name}\u0000`;
     for (const id of buffers.keys()) if (id.startsWith(prefix)) buffers.delete(id);
     setQuery({ cases: query.cases.filter((entry) => entry !== name) });
@@ -698,23 +582,12 @@ const shell = createShell({
   },
   onSave: saveAll,
   onLoad() {
-    // Save writes BOTH a .gvap file and the origin-private cache, and tells the
+    // Save writes BOTH a .gvip file and the origin-private cache, and tells the
     // user the cache is "for the Load button" -- so try it first. Anything else
     // (no cache on this machine, a cache from an older build) falls through to
     // opening a file, which is the only option on a machine that never saved.
     void loadAll().catch(() => {
       bundleInput.click();
-    });
-  },
-  onGroupings() {
-    void showGroupEditor({ present: presentAreas() }).then((csv) => {
-      if (csv === null) return;
-      try {
-        applyGroupings(csv);
-      } catch (error) {
-        notes = [error instanceof Error ? error.message : String(error)];
-        render();
-      }
     });
   },
 });
@@ -726,10 +599,11 @@ const charts = createCharts((dim) => setQuery({ boxDim: dim }));
 if (!hasSimd()) {
   notes = [NO_SIMD_MESSAGE];
 } else {
-  // The storage worker is the only one that can warm at page load. The parse
-  // pool cannot: its workers hash the area axis, and the axis is not known
-  // until a file has been read.
+  // Both worker pools warm at page load. The parse pool can do so now that
+  // workers hold no per-study state: an interface is located by the JS-side
+  // column plan, not by a hash table built from the first file (D13).
   warmStorage();
+  warmPool();
 }
 
 render();

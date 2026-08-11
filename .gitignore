@@ -8,11 +8,11 @@ testcasefull.csv
 **/real-data/
 /tmp-data/
 
-# Real exports and the real grouping structure. testcase.csv is 86 rows of a
-# genuine export (real values, real area codes); Groupings.csv is the utility's
-# actual area -> grouping rollup. Both stay local. The tests build their own
-# synthetic export and mapping in test_fixtures.mjs — nothing data-shaped is
-# tracked in this repo.
+# Real exports stay local. The tracked exception is input/*.csv, which are
+# ANONYMISED samples committed on purpose and used by test_samples.mjs; the
+# unit tests otherwise build their own synthetic export in test_fixtures.mjs.
+# A real study export dropped anywhere else shows up in `git status` and the
+# check above is what catches it.
 testcase.csv
 Groupings.csv
 

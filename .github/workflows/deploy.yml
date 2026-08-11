@@ -43,9 +43,9 @@ jobs:
 
       - run: npm ci
 
-      # tsc --noEmit plus the three assert-based scripts. They run on a
-      # synthetic export generated in memory (test_fixtures.mjs) — no real data
-      # is tracked in or read by this repo.
+      # tsc --noEmit plus the four assert-based scripts: three against a
+      # synthetic export generated in memory (test_fixtures.mjs), and
+      # test_samples.mjs against the anonymised sample exports in input/.
       - name: Test
         run: npm test
 

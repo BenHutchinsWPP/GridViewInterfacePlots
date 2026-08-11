@@ -12,7 +12,8 @@ cd "$(dirname "$0")"
 CLANG=${CLANG:-clang-18}
 export PATH="/usr/lib/llvm-18/bin:$PATH"   # wasm-ld lives here
 
-# Per-worker linear memory: 12 MiB input window + 8.4 MiB slab, rounded up.
+# Per-worker linear memory: 12 MiB input window + 8 MiB slab (512 interfaces x
+# 4,096 hours x 4 B), rounded up.
 # Sized to a BLOCK, never to a case -- see ../docs/footguns.md (#22).
 INITIAL_MEMORY=$((32 * 1024 * 1024))
 

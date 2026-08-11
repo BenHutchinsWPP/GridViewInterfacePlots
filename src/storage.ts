@@ -3,47 +3,48 @@
 // Save / load of the processed cubes, main-thread side. The actual OPFS I/O
 // runs in storage-worker.ts because `createSyncAccessHandle` is worker-only.
 //
-// The manifest carries BOTH the retained column list and the full source
-// column list. Without the source list a saved bundle looks like a study
-// that never had emissions data, when in fact the user just did not keep
-// those columns -- and the UI needs to offer a re-ingest for the second case
-// and not the first.
+// The manifest carries BOTH the retained interface list and the full source
+// column list. Without the source list a saved bundle looks like a study that
+// never monitored a path, when in fact the user just did not keep that column
+// -- and the UI needs to offer a re-ingest for the second case and not the
+// first.
 //
 // Presence and TOU bitmaps ride in the manifest as base64. They are small
-// (2 KB and 8.8 KB per case) and keeping them out of the binary section
-// means the cube bytes stay a plain concatenation of Float32Array dumps.
+// (one byte per interface, and 8.8 KB per case) and keeping them out of the
+// binary section means the cube bytes stay a plain concatenation of
+// Float32Array dumps.
 
 import { HOURS_PER_YEAR } from './calendar';
-import { allAreas, exportGroupings } from './groupings';
 import type { CaseData } from './types';
 import type { StorageRequest, StorageResponse } from './storage-worker';
 
 interface ManifestCase {
   name: string;
   year: number;
-  /** The cube's metric axis, in index order. */
-  metrics: string[];
-  /** Every column the source CSV carried, retained or not. */
+  /** The cube's interface axis, in index order. */
+  interfaces: string[];
+  /** Every interface the source CSV carried, retained or not. */
   sourceColumns: string[];
-  areas: string[];
+  /** The file's title-line quantity, e.g. `Power Flow (MW)`, and its unit. */
+  quantity: string;
+  unit: string;
   presence: string;
   tou: string;
   cubeBytes: number;
 }
 
 interface Manifest {
-  version: 1;
+  /** 2 = the interface cube. Version 1 was the area cube of the tool this
+   * grew out of; it has a different shape and a different magic, so it is
+   * rejected at the magic rather than half-read here. */
+  version: 2;
   cases: ManifestCase[];
-  /** The area -> grouping mapping in effect when this bundle was written, as
-   * a Groupings.csv. Optional: bundles written before the mapping became
-   * editable at runtime do not carry one, and still load. */
-  groupings?: string;
 }
 
-// ponytail: single String.fromCharCode spread, ceiling is the argument-count
-// limit (~64K). Only ever called on `presence` (43 x 50 = 2,150 B at most) and
-// `tou` (8,760 B fixed), so the chunked loop this replaced could never run
-// twice. Chunk again if either grows past ~32 KB.
+// Single String.fromCharCode spread; the ceiling is the argument-count limit
+// (~64K). Only ever called on `presence` (one byte per interface) and `tou`
+// (8,760 B fixed), so the chunked loop this replaced could never run twice.
+// Chunk again if either grows past ~32 KB.
 function toBase64(bytes: Uint8Array): string {
   return btoa(String.fromCharCode(...bytes));
 }
@@ -86,14 +87,14 @@ function request(message: StorageRequest, transfer: Transferable[] = []): Promis
 
 function buildManifest(cases: CaseData[]): Manifest {
   return {
-    version: 1,
-    groupings: exportGroupings(),
+    version: 2,
     cases: cases.map((data) => ({
       name: data.name,
       year: data.year,
-      metrics: data.metrics,
+      interfaces: data.interfaces,
       sourceColumns: data.sourceColumns,
-      areas: data.areas,
+      quantity: data.quantity,
+      unit: data.unit,
       presence: toBase64(data.presence),
       tou: toBase64(data.tou),
       cubeBytes: data.cube.byteLength,
@@ -115,7 +116,7 @@ export async function saveBundle(
   for (let i = 0; i < cases.length; i++) {
     // Cloned, not transferred: transferring would detach the live cube the
     // app is still rendering from. One case at a time bounds the transient
-    // copy at ~75 MB instead of the whole working set.
+    // copy at one case instead of the whole working set.
     await request({ kind: 'saveChunk', bytes: cubeBytes(cases[i]) });
     onProgress?.(i + 1, cases.length);
   }
@@ -124,13 +125,13 @@ export async function saveBundle(
 
 // ---------------------------------------------------------------- disk file
 //
-// The .gvap file is the same manifest and the same cube bytes as the OPFS
-// bundle, in one stream: "GVAP" | uint32 manifest length | manifest JSON |
+// The .gvip file is the same manifest and the same cube bytes as the OPFS
+// bundle, in one stream: "GVIP" | uint32 manifest length | manifest JSON |
 // cube bytes, concatenated in manifest order. It is written through a
 // FileSystemWritableFileStream where the browser has one, so a multi-case
 // study never needs a second full copy of itself in memory to be saved.
 
-const MAGIC = 'GVAP';
+const MAGIC = 'GVIP';
 
 /** Chrome/Edge expose showSaveFilePicker; nothing else does yet. */
 interface SavePickerWindow {
@@ -154,13 +155,18 @@ export async function downloadBundle(
   header.set(new TextEncoder().encode(MAGIC));
   new DataView(header.buffer).setUint32(MAGIC.length, manifest.byteLength, true);
 
-  const suggestedName = `gridview-${cases.length}-case${cases.length === 1 ? '' : 's'}.gvap`;
+  const suggestedName = `gridview-interfaces-${cases.length}-case${cases.length === 1 ? '' : 's'}.gvip`;
   const picker = (window as SavePickerWindow).showSaveFilePicker;
 
   if (picker) {
     const handle = await picker.call(window, {
       suggestedName,
-      types: [{ description: 'GridView Area Plots bundle', accept: { 'application/octet-stream': ['.gvap'] } }],
+      types: [
+        {
+          description: 'GridView Interface Plots bundle',
+          accept: { 'application/octet-stream': ['.gvip'] },
+        },
+      ],
     });
     const stream = await handle.createWritable();
     await stream.write(header);
@@ -198,14 +204,17 @@ export async function isBundleFile(file: File): Promise<boolean> {
 
 export async function readBundleFile(file: File): Promise<RestoredBundle> {
   const headerBytes = new Uint8Array(await file.slice(0, MAGIC.length + 4).arrayBuffer());
-  if (new TextDecoder().decode(headerBytes.subarray(0, MAGIC.length)) !== MAGIC) {
-    throw new Error(`${file.name} is not a GridView bundle.`);
+  const magic = new TextDecoder().decode(headerBytes.subarray(0, MAGIC.length));
+  if (magic !== MAGIC) {
+    throw new Error(
+      magic === 'GVAP'
+        ? `${file.name} is an area-plots bundle (GVAP). This tool reads interface bundles.`
+        : `${file.name} is not a GridView interface bundle.`,
+    );
   }
   const manifestLength = new DataView(headerBytes.buffer).getUint32(MAGIC.length, true);
   const start = MAGIC.length + 4;
-  const manifest = JSON.parse(
-    await file.slice(start, start + manifestLength).text(),
-  ) as Manifest;
+  const manifest = JSON.parse(await file.slice(start, start + manifestLength).text()) as Manifest;
 
   let offset = start + manifestLength;
   const cubes: ArrayBuffer[] = [];
@@ -218,8 +227,6 @@ export async function readBundleFile(file: File): Promise<RestoredBundle> {
 
 export interface RestoredBundle {
   cases: CaseData[];
-  /** The mapping the bundle was saved under, or null for older bundles. */
-  groupings: string | null;
 }
 
 export async function loadBundle(): Promise<RestoredBundle> {
@@ -229,32 +236,33 @@ export async function loadBundle(): Promise<RestoredBundle> {
 }
 
 function restore(manifest: Manifest, cubes: ArrayBuffer[]): RestoredBundle {
-  return { cases: casesFromManifest(manifest, cubes), groupings: manifest.groupings ?? null };
+  return { cases: casesFromManifest(manifest, cubes) };
 }
 
 function casesFromManifest(manifest: Manifest, cubes: ArrayBuffer[]): CaseData[] {
-  if (manifest.version !== 1) {
-    throw new Error(`Saved bundle is version ${manifest.version}; this build reads version 1.`);
+  if (manifest.version !== 2) {
+    throw new Error(`Saved bundle is version ${manifest.version}; this build reads version 2.`);
   }
 
   return manifest.cases.map((entry, index) => {
     const cube = new Float32Array(cubes[index]);
-    const expected = entry.areas.length * entry.metrics.length * HOURS_PER_YEAR;
+    const expected = entry.interfaces.length * HOURS_PER_YEAR;
     if (cube.length !== expected) {
       throw new Error(
         `Saved cube for "${entry.name}" is ${cube.length} values, expected ${expected} ` +
-          `(${entry.areas.length} areas × ${entry.metrics.length} metrics × ${HOURS_PER_YEAR} h).`,
+          `(${entry.interfaces.length} interfaces × ${HOURS_PER_YEAR} h).`,
       );
     }
     return {
       name: entry.name,
       cube,
-      areas: entry.areas.length > 0 ? entry.areas : allAreas(),
-      metrics: entry.metrics,
+      interfaces: entry.interfaces,
       presence: fromBase64(entry.presence),
       tou: fromBase64(entry.tou),
       sourceColumns: entry.sourceColumns,
       year: entry.year,
+      quantity: entry.quantity ?? '',
+      unit: entry.unit ?? '',
     };
   });
 }

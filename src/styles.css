@@ -419,6 +419,29 @@ body {
   color: var(--color-text-secondary);
 }
 
+/* The interface list is long enough to need a search of its own. */
+.rail-filter {
+  width: 100%;
+  padding: 3px 6px;
+  margin-bottom: 4px;
+  font-size: 11px;
+  border: 1px solid var(--color-border);
+  border-radius: 3px;
+  background: var(--color-bg-primary);
+  color: var(--color-text-primary);
+}
+
+/* The case's unit, e.g. MW or $. One file is one quantity (D13), so this
+ * belongs next to the case and not next to a series. */
+.case-tag {
+  flex-shrink: 0;
+  font-size: 10px;
+  color: var(--color-text-secondary);
+  border: 1px solid var(--color-border);
+  border-radius: 2px;
+  padding: 0 3px;
+}
+
 /* Case list — this is the legend, and it appears exactly once */
 .case-item {
   display: flex;
@@ -535,6 +558,22 @@ body {
 .pane-banner-refusal {
   border-left-color: var(--color-case-4);
   color: var(--color-text-primary);
+}
+
+/* A note sits OVER the chart, pinned to the bottom of the pane. In flow it
+ * would be pushed below the chart host, which fills the pane and clips it --
+ * and the notes that fire here are the ones that must be read: an interface
+ * that never binds is zero in every hour, which looks exactly like a failed
+ * load until the pane says otherwise (footgun 19). */
+.pane-banner-note {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 6px;
+  margin: 0;
+  z-index: 6;
+  background: var(--color-bg-secondary);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12);
 }
 
 .box-canvas { display: block; }
@@ -738,119 +777,6 @@ body {
 
 /* Calculated columns. Not in any export's header, so the folder is marked
  * rather than reading as another block of source data. */
-.picker-calculated {
-  border-left: 3px solid var(--color-accent);
-  background: var(--color-bg-secondary);
-  border-radius: 3px;
-}
-
-.picker-calculated > .picker-folder { color: var(--color-accent); }
-
-.picker-calculated > .modal-row .modal-row-name { font-style: italic; }
-
-/* Grouping editor: groups | members of the selected group | the area axis.
- * Membership is many-to-many, so an area lives on the right until it is
- * dragged in and stays available to every other group afterwards. */
-.modal-wide { width: min(980px, 94vw); }
-
-.groups-grid {
-  display: grid;
-  grid-template-columns: 1fr 1.2fr 1.2fr;
-  gap: 10px;
-  min-height: 320px;
-}
-
-.groups-column {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  min-width: 0;
-}
-
-.groups-head {
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--color-text-secondary);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.groups-list {
-  flex: 1;
-  overflow-y: auto;
-  border: 1px solid var(--color-border);
-  border-radius: 3px;
-  padding: 4px;
-  min-height: 240px;
-  max-height: 46vh;
-}
-
-.groups-dropping {
-  border-color: var(--color-accent);
-  background: var(--color-bg-secondary);
-}
-
-.groups-item {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 3px 6px;
-  font-size: 12px;
-  border-radius: 3px;
-  cursor: grab;
-  user-select: none;
-}
-
-.groups-item:hover { background: var(--color-bg-secondary); }
-.groups-item > span:first-child {
-  flex: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.groups-group { cursor: pointer; }
-
-.groups-selected {
-  background: var(--color-accent);
-  color: #ffffff;
-}
-
-.groups-selected:hover { background: var(--color-accent); }
-.groups-selected .groups-badge { color: #ffffff; border-color: rgba(255, 255, 255, 0.5); }
-
-.groups-badge {
-  font-size: 10px;
-  padding: 0 4px;
-  border: 1px solid var(--color-border);
-  border-radius: 8px;
-  color: var(--color-text-secondary);
-}
-
-/* An area a group claims but nothing can plot: either not in this build, or
- * carrying no data in the cases that are loaded. */
-.groups-item-missing { color: var(--color-case-4); }
-
-.groups-flag {
-  font-size: 10px;
-  font-style: italic;
-  white-space: nowrap;
-}
-
-.groups-empty {
-  padding: 8px 6px;
-  font-size: 11px;
-  font-style: italic;
-  color: var(--color-text-secondary);
-}
-
-.groups-newrow { display: flex; gap: 6px; }
-
-/* .modal-filter is flex:1 for the horizontal toolbars it was written for;
- * in a vertical column that stretches it into a tall empty box. */
-.groups-column > .modal-filter { flex: 0 0 auto; }
-
 .modal-filter {
   flex: 1;
   padding: 5px 8px;

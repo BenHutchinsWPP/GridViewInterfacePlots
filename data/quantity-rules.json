@@ -1,0 +1,51 @@
+{
+  "contract": "An interface export is ONE quantity for every interface it monitors, named on the file's title line: \"Interface Hourly 'Power Flow (MW)' Data for Year 2034\". So the aggregation rule is a property of the FILE, not of the column, and it is resolved from the unit in that title. `temporal` is the only rule left: interfaces are never summed across each other (a path total is not a quantity anyone asked for), so there is no spatial rule to get wrong. SUM means a period total over the filtered hours is meaningful; MEAN means it is not, and the stats table shows no total at all rather than a plausible wrong one. Resolution: exact match on `unit` (case-sensitive), else no rule -- an unrecognised unit gets MEAN and no total, never a guess.",
+  "units": [
+    {
+      "unit": "MW",
+      "class": "RATE",
+      "temporal": "MEAN",
+      "note": "MW is a rate. Summing it over hours produces neither MW nor MWh once a filter has removed hours from the interval, so no total is offered."
+    },
+    {
+      "unit": "MWh",
+      "class": "EXTENSIVE",
+      "temporal": "SUM"
+    },
+    {
+      "unit": "$",
+      "class": "EXTENSIVE",
+      "temporal": "SUM"
+    },
+    {
+      "unit": "k$",
+      "class": "EXTENSIVE",
+      "temporal": "SUM"
+    },
+    {
+      "unit": "$/MWh",
+      "class": "INTENSIVE",
+      "temporal": "MEAN",
+      "note": "A price is intensive: the sum of hourly prices is not a price. The mean over the kept hours is the unweighted mean of the hours themselves."
+    },
+    {
+      "unit": "$/MW",
+      "class": "INTENSIVE",
+      "temporal": "MEAN"
+    },
+    {
+      "unit": "%",
+      "class": "INTENSIVE",
+      "temporal": "MEAN"
+    },
+    {
+      "unit": "h",
+      "class": "EXTENSIVE",
+      "temporal": "SUM"
+    }
+  ],
+  "quantities": [
+    "Power Flow (MW)",
+    "Congestion Cost ($)"
+  ]
+}

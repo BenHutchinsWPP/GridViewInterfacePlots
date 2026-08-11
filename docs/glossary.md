@@ -10,60 +10,51 @@ Utility, market and analysis terms used throughout these docs and in the column 
 
 **GridView** — the production-cost simulation tool these exports come from. It simulates hourly dispatch of a power system for a full year.
 
-**Area** — a modelled region within the simulation (e.g. `AREA01`, `AREA02`). This export has 43. The `Name` column holds the area code.
+**Monitored interface** — a transmission boundary the study watches: a WECC path, a tie between two balancing authorities, or a named facility. GridView reports one value per interface per hour, and the export makes each interface a **column**.
 
-**Grouping** — a named set of areas defined in a user-supplied `Groupings.csv` (e.g. `Zone 1` = `AREA01` + `AREA02`). Five groupings cover the 43 areas. Not a GridView concept; ours.
+**Path** — used interchangeably with interface here. Numbered WECC paths (`P86 West of John Day E-W`) are the most recognisable kind, but a monitored interface can be any cutplane the study defines.
 
-**LMP** — *Locational Marginal Price*, the $/MWh price of energy at a location. Decomposes into three additive components: **energy**, **loss** and **congestion**. Congestion is commonly negative.
+**Power flow (MW)** — the flow across an interface in an hour. **Signed**: the sign is the direction, and 42.3% of the sample's cells are negative.
 
-**A.S.** — *Ancillary Services*: reserve products procured alongside energy. Six types appear here, each as a triad of `Requirement` / `Served Amount` / `Price`:
+**Congestion cost ($)** — the cost of the transmission constraint on an interface in an hour: zero whenever the path is not binding, which in the sample is most hours for most paths.
 
-| Code | Meaning |
-|---|---|
-| `RU` / `RD` | Regulation Up / Down |
-| `SR` | Spinning Reserve |
-| `LFU` / `LFD` | Load Following Up / Down |
-| `FR` | Frequency Response |
+**Binding** — an interface is binding in an hour when its flow is held at a limit, which is when congestion cost becomes non-zero.
+
+**Limit column** — some studies export a path's rating alongside its flow, as a separate interface column (`…_Limit`). It is just another column to this tool.
+
+**LMP** — *Locational Marginal Price*, the $/MWh price of energy at a location. Its **congestion component** is what an interface's congestion cost is charged against. Not in an interface export; here for context.
 
 **TOU** — *Time of Use*: `OnPeak` or `OffPeak`. A tariff classification, **not** a formula. In the real export the rule is hours-ending 6–22 Monday–Saturday, with Sunday fully OffPeak.
 
 **HE** — *Hour Ending*. `HE 6` covers 05:00–06:00. The `Hour` column is 1–24 hour-ending.
 
-**Unserved load** — demand the simulation could not meet. Nearly always zero (99.2% here); non-zero values are significant events.
-
-**Spillage** — generation (typically hydro or renewable) that was available but not used.
-
-**Net Load** — load minus non-dispatchable generation. A MW quantity, i.e. a stock.
-
-**k$** — thousands of dollars. All money columns are in these units.
+**k$** — thousands of dollars. An interface export's costs are in plain `$`; `k$` is carried in the unit table because area exports use it and a study may.
 
 ## Data and analysis
 
-**Case** — one simulation run, one CSV. Cases are compared against each other; ten at once is the design target.
+**Case** — one CSV: one simulation run's values for **one quantity** across every interface it monitors. Two quantities from the same run are two cases, and the case list shows each one's unit ([D13](decisions.md#d13--one-file-is-one-quantity-a-path-is-a-column)).
 
-**The cube** — the in-memory representation: a `Float32Array` of `[area × metric × hour]`. See [architecture.md](architecture.md#the-cube).
+**Quantity** — what a file measures, quoted on its title line: `Power Flow (MW)`, `Congestion Cost ($)`. Its parenthesised unit is what the aggregation rule is keyed on.
+
+**The cube** — the in-memory representation: a `Float32Array` of `[interface × hour]`. See [architecture.md](architecture.md#the-cube).
 
 **Extensive quantity** — one that **adds** when you combine regions or hours: energy (MWh), money (k$), emissions mass. Summing is correct.
 
-**Intensive quantity** — one that does **not** add: prices ($/MWh). Combining requires a **weighted mean**, never a sum and never a plain average.
+**Intensive quantity** — one that does **not** add: prices ($/MWh). A sum of them is meaningless; combining them properly needs a weight, and an interface export carries none, so this tool only ever means them over hours.
 
-**Capacity / stock quantity** — MW columns. They sum across *areas* but must be **averaged** across *hours* — summing 8,760 hourly MW values produces MW·h mislabelled as MW.
+**Rate quantity** — MW columns. Averaged across hours, never summed: adding 8,760 hourly MW values produces MW·h mislabelled as MW, and once a filter has removed hours it is not even that.
 
-**Weighted mean** — `Σ(value × weight) / Σweight`. Each price column has a specific weight: `Avg LMP Weighted by Load` weights by `Load (MWh)`; each A.S. price weights by its matching `Served Amount`. Getting the weight wrong is silent.
-
-**Duration curve** — the values of a series sorted by magnitude and plotted against percent-of-interval, discarding time order. Answers "how many hours was it above X?". Ascending by default here; direction is a display toggle.
+**Duration curve** — the values of a series sorted by magnitude and plotted against percent-of-interval, discarding time order. Answers "how many hours was it above X?". Ascending here, resampled onto a shared percent axis so cases keeping different numbers of hours overlay.
 
 **Box & whisker** — min / p25 / median / p75 / max plus outliers, computed per group along a user-selected dimension.
 
 **Welford's algorithm** — a single-pass, numerically stable method for mean and variance. Required here because naive `Σx²` catastrophically cancels on large-mean data — see [footgun 11](footguns.md#11-stddev-on-float32-loses-precision).
 
-**Schema drift** — the fact that different exports carry different columns *in different orders*. Handled with a union schema plus a per-case presence bitmap, keyed by trimmed canonical name.
+**Schema drift** — the fact that different exports carry different columns *in different orders*. A path list is a study input, so this is routine here. Handled with a union schema plus a per-case presence bitmap, keyed by trimmed name ([D14](decisions.md#d14--the-interface-axis-is-the-union-of-every-dropped-file)).
 
-**Presence bitmap** — per case, which metrics that case actually exported. Load-bearing at query time, not just ingest: absent metrics are NaN in the cube and NaN poisons every kernel silently.
+**Union schema** — the interface axis the cube is built on: every path any dropped file monitors, in first-seen order.
 
-**Calculated column** — a metric no export carries, filled at ingest from columns that do (`Gen - Load`, `Net Interchange (MWh)`, `Generation / Installed Capacity`). Offered in the picker under its own **Calculations** group, and present only when every operand was retained. See [features.md](features.md).
-
-**Net interchange** — imports minus exports, i.e. an area or group's net trade position; positive means net importer. The gross `Import Flow` / `Export Flow` columns double-count flows internal to a grouping, and the difference cancels them.
+**Presence bitmap** — per case, which interfaces that case actually monitored. Load-bearing at query time, not just ingest: absent planes are NaN in the cube and NaN poisons every kernel silently.
 
 ## Browser and platform
 
@@ -79,4 +70,4 @@ Utility, market and analysis terms used throughout these docs and in the column 
 
 **Vectorized classification** — the simdjson/simdcsv technique: compare 16 bytes at once against delimiters and extract a bitmask, instead of testing bytes one at a time.
 
-**Slab** — one worker's parse output: a compact `[43 areas × 50 metrics × 1024 hours]` block the main thread blits into the cube at the block's hour offset.
+**Slab** — one worker's parse output: a compact `[512 interfaces × 4,096 hours]` block, of which only the retained planes are transferred back, and which the main thread blits into the cube at the block's hour offset.

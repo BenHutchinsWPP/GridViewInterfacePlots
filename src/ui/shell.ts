@@ -2,25 +2,24 @@
 //
 // The control rail, the status sentence, focus mode, keyboard, drag-and-drop.
 //
-// The rail is fixed and persistent, never a drawer (GUI decision 2):
-// filters change constantly during analysis, and a control you have to open
-// first is a control you use less. There is no Apply button (decision 4) --
-// re-filtering measures 0.055 ms against a 100 ms gate, so an Apply button
-// would exist only to hide latency this app does not have.
+// The rail is fixed and persistent, never a drawer: filters change constantly
+// during analysis, and a control you have to open first is a control you use
+// less. There is no Apply button -- re-filtering measures well under a
+// millisecond, so an Apply button would exist only to hide latency this app
+// does not have.
 //
 // Everything here is a pure function of the frozen Query plus the case list.
 // `render()` rebuilds the rail's contents; the containers and their event
 // listeners are created once and survive every render.
 
 import { DAY_NAMES, HOURS_PER_YEAR, MONTH_NAMES, SEASON_NAMES, TOU_LABELS } from '../calendar';
-import { ALL_AREAS, allAreas, areasIn, groupingNames } from '../groupings';
-import type { CaseData, Filters, PaneView, Query, Selection } from '../types';
-import { metricGroups } from '../rules';
+import type { CaseData, Filters, PaneView, Query } from '../types';
+import { interfaceGroups } from '../rules';
 import { createChipGrid } from './chips';
 
 /** Ten categorical colours, assigned at drop time and never reshuffled.
- * A ten-series overlay is only readable if the mapping is learned once
- * (GUI decision 5), so the legend lives in the rail and nowhere else. */
+ * A ten-series overlay is only readable if the mapping is learned once,
+ * so the legend lives in the rail and nowhere else. */
 export const CASE_COLORS = [
   '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
   '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
@@ -30,8 +29,12 @@ export interface ShellState {
   cases: CaseData[];
   /** Names of the cases currently drawn -- Query.cases, as a fast lookup. */
   enabled: Set<string>;
-  /** Metric axis offered in the rail: the union of every case's retained set. */
-  metrics: string[];
+  /** Interface axis offered in the rail: the union of every case's retained
+   * set. */
+  interfaces: string[];
+  /** Interface -> the case names that carry it, for the rail's "in 1 of 2
+   * files" hint. */
+  coverage: Map<string, string[]>;
   /** One row per drawn line: the cross product is no longer readable from the
    * case list alone, so the legend names every line it produced. */
   legend: { label: string; color: string }[];
@@ -52,7 +55,6 @@ export interface ShellHandlers {
   onSave(): void;
   /** Open a saved bundle from disk. */
   onLoad(): void;
-  onGroupings(): void;
 }
 
 export interface Shell {
@@ -96,9 +98,9 @@ function summarise<T>(
   return parts.join(', ');
 }
 
-/** The status bar is a sentence, not a widget (GUI decision 6): analysts
- * screenshot these panes into decks, and a screenshot that states its own
- * filters removes a whole class of "which filter was this?" mistakes. */
+/** The status bar is a sentence, not a widget: analysts screenshot these
+ * panes into decks, and a screenshot that states its own filters removes a
+ * whole class of "which filter was this?" mistakes. */
 export function statusSentence(query: Query, keptHours: number): string {
   const { filters } = query;
   const months = Array.from({ length: 12 }, (_, i) => i + 1);
@@ -119,16 +121,23 @@ export function statusSentence(query: Query, keptHours: number): string {
   if (filters.tou !== null) {
     parts.push(summarise(filters.tou, TOU_LABELS, String, 'all TOU'));
   }
-  parts.push(query.metrics.join(' + '));
+  // The interface list is the long axis now; naming ten paths in the status
+  // bar would push the filters off the end of it.
+  parts.push(
+    query.interfaces.length <= 3
+      ? query.interfaces.join(' + ')
+      : `${query.interfaces.length} interfaces`,
+  );
   const plural = query.cases.length === 1 ? '' : 's';
-  parts.push(`${query.selections.map((s) => s.name).join(' + ')} · ${query.cases.length} case${plural}`);
+  parts.push(`${query.cases.length} case${plural}`);
   return parts.join(' · ');
 }
 
 export function createShell(handlers: ShellHandlers): Shell {
   const casesList = byId('cases-list');
-  const metricDropdown = byId<HTMLSelectElement>('metric-dropdown');
-  const areaDropdown = byId<HTMLSelectElement>('area-dropdown');
+  const interfaceDropdown = byId<HTMLSelectElement>('interface-dropdown');
+  const interfaceFilter = byId<HTMLInputElement>('interface-filter');
+  const interfaceSummary = byId('interface-summary');
   const seriesLegend = byId('series-legend');
   const statusText = byId('status-text');
   const memoryReadout = byId('memory-readout');
@@ -184,26 +193,38 @@ export function createShell(handlers: ShellHandlers): Shell {
   byId<HTMLButtonElement>('add-cases-btn').addEventListener('click', () => handlers.onAddCases());
   byId<HTMLButtonElement>('save-btn').addEventListener('click', () => handlers.onSave());
   byId<HTMLButtonElement>('load-btn').addEventListener('click', () => handlers.onLoad());
-  byId<HTMLButtonElement>('groupings-btn').addEventListener('click', () => handlers.onGroupings());
 
-  /** Selected <option> values, or the first option when a multi-select ends
-   * up empty -- a query with no metric or no area draws nothing and there is
-   * no useful state to be in. */
-  function chosen(select: HTMLSelectElement): string[] {
-    const values = Array.from(select.selectedOptions, (option) => option.value);
-    return values.length > 0 ? values : [select.options[0]?.value].filter(Boolean);
+  /**
+   * What the interface list should become after a click in it.
+   *
+   * The <select> only ever holds the interfaces matching the filter box, so
+   * its selected options are not the whole selection: a path selected under
+   * an earlier search is still selected, it is simply not on screen. Keeping
+   * those is what makes "search, pick, search again, pick again" work, so the
+   * result is (everything selected that is currently hidden) + (what is
+   * ticked on screen).
+   */
+  function selectedInterfaces(shown: string[]): string[] {
+    const onScreen = new Set(Array.from(interfaceDropdown.selectedOptions, (o) => o.value));
+    const hiddenKept = currentSelection.filter((name) => !shown.includes(name));
+    const next = [...hiddenKept, ...shown.filter((name) => onScreen.has(name))];
+    // A query with no interface draws nothing and there is no useful state to
+    // be in, so an empty result falls back to the first visible path.
+    return next.length > 0 ? next : shown.slice(0, 1);
   }
 
-  metricDropdown.addEventListener('change', () => {
-    handlers.onQueryChange({ metrics: chosen(metricDropdown) });
+  /** The last rendered query's interface list, for the fold above. */
+  let currentSelection: string[] = [];
+  /** The interfaces currently in the <select>, in option order. */
+  let shownInterfaces: string[] = [];
+
+  interfaceDropdown.addEventListener('change', () => {
+    handlers.onQueryChange({ interfaces: selectedInterfaces(shownInterfaces) });
   });
-  areaDropdown.addEventListener('change', () => {
-    handlers.onQueryChange({
-      selections: chosen(areaDropdown).map((value) => {
-        const [kind, name] = value.split(':');
-        return { kind: kind as 'area' | 'grouping', name };
-      }),
-    });
+  interfaceFilter.addEventListener('input', () => {
+    // Repaint through the app so the rail stays a pure function of the query:
+    // the filter box changes what is listed, never what is selected.
+    handlers.onQueryChange({});
   });
 
   casesList.addEventListener('click', (event) => {
@@ -261,11 +282,13 @@ export function createShell(handlers: ShellHandlers): Shell {
     } else if (event.key === 'r') {
       resetFilters();
     } else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      // Step through the listed interfaces one at a time -- the fastest way
+      // to flip through paths without touching the mouse.
       const step = event.key === 'ArrowDown' ? 1 : -1;
-      const next = metricDropdown.selectedIndex + step;
-      if (next >= 0 && next < metricDropdown.options.length) {
-        metricDropdown.selectedIndex = next;
-        handlers.onQueryChange({ metrics: [metricDropdown.value] });
+      const at = shownInterfaces.indexOf(currentSelection[currentSelection.length - 1]);
+      const next = at + step;
+      if (next >= 0 && next < shownInterfaces.length) {
+        handlers.onQueryChange({ interfaces: [shownInterfaces[next]] });
       }
       event.preventDefault();
     }
@@ -274,7 +297,7 @@ export function createShell(handlers: ShellHandlers): Shell {
   // ------------------------------------------------------------ drag and drop
   const dropOverlay = document.createElement('div');
   dropOverlay.className = 'drop-overlay';
-  dropOverlay.textContent = 'Drop GridView CSV exports to load them';
+  dropOverlay.textContent = 'Drop GridView interface CSV exports to load them';
   document.body.appendChild(dropOverlay);
 
   let dragDepth = 0;
@@ -301,7 +324,12 @@ export function createShell(handlers: ShellHandlers): Shell {
   // ------------------------------------------------------------ render
   return {
     render(query, state) {
-      // CASES — the legend lives here, once, and nowhere else (decision 5).
+      currentSelection = [...query.interfaces];
+
+      // CASES — the legend lives here, once, and nowhere else. A case is one
+      // file, so its quantity ("Power Flow (MW)") is a property of the case
+      // and is named next to it: two cases of different quantities overlay on
+      // two axes and the case list is where that is explained.
       casesList.replaceChildren();
       if (state.cases.length === 0) {
         const empty = document.createElement('div');
@@ -322,8 +350,15 @@ export function createShell(handlers: ShellHandlers): Shell {
         const label = document.createElement('span');
         label.className = 'case-name';
         label.textContent = data.name;
-        label.title = `${data.name} — ${data.year}, ${data.metrics.length} metrics`;
+        const quantity = data.quantity || 'unknown quantity';
+        label.title = `${data.name} — ${quantity}, ${data.year}, ${data.interfaces.length} interfaces`;
         item.appendChild(label);
+
+        const tag = document.createElement('span');
+        tag.className = 'case-tag';
+        tag.textContent = data.unit || '?';
+        tag.title = quantity;
+        item.appendChild(tag);
 
         const remove = document.createElement('button');
         remove.type = 'button';
@@ -335,65 +370,47 @@ export function createShell(handlers: ShellHandlers): Shell {
         casesList.appendChild(item);
       });
 
-      // SERIES. Grouped exactly as the import picker groups them -- one
-      // classification shared by both, so a column is never filed under one
-      // heading there and a different one here -- with <optgroup>, which a
-      // multi-select renders natively.
-      if (metricDropdown.dataset.signature !== state.metrics.join(' ')) {
-        metricDropdown.dataset.signature = state.metrics.join(' ');
-        metricDropdown.replaceChildren();
-        for (const { title, names } of metricGroups(state.metrics)) {
+      // INTERFACES. The filter box narrows what is listed; the selection is
+      // the query's, so a path picked under a previous search stays picked
+      // and simply is not on screen.
+      const needle = interfaceFilter.value.trim().toLowerCase();
+      const matching = needle
+        ? state.interfaces.filter((name) => name.toLowerCase().includes(needle))
+        : state.interfaces;
+      const groups = interfaceGroups(matching, state.coverage, state.cases.length);
+      shownInterfaces = groups.flatMap((group) => group.names);
+
+      const signature = `${needle}\u0000${shownInterfaces.join('')}`;
+      if (interfaceDropdown.dataset.signature !== signature) {
+        interfaceDropdown.dataset.signature = signature;
+        interfaceDropdown.replaceChildren();
+        for (const { title, names } of groups) {
           const group = document.createElement('optgroup');
           group.label = title;
-          for (const metric of names) {
+          for (const name of names) {
             const option = document.createElement('option');
-            option.value = metric;
-            option.textContent = metric;
+            option.value = name;
+            option.textContent = name;
+            const carriers = state.coverage.get(name)?.length ?? 0;
+            if (state.cases.length > 1 && carriers < state.cases.length) {
+              option.title = `In ${carriers} of ${state.cases.length} cases`;
+            }
             group.appendChild(option);
           }
-          metricDropdown.appendChild(group);
+          interfaceDropdown.appendChild(group);
         }
       }
-      const wantedMetrics = new Set(query.metrics);
-      for (const option of metricDropdown.options) option.selected = wantedMetrics.has(option.value);
+      const wanted = new Set(query.interfaces);
+      for (const option of interfaceDropdown.options) option.selected = wanted.has(option.value);
 
-      // Keyed on the mapping's contents, not a one-shot flag: a Groupings.csv
-      // loaded at runtime has to rebuild this list.
-      const areaSignature = `${groupingNames().join(',')}|${allAreas().join(',')}`;
-      if (areaDropdown.dataset.built !== areaSignature) {
-        areaDropdown.dataset.built = areaSignature;
-        areaDropdown.replaceChildren();
-        const groups = document.createElement('optgroup');
-        groups.label = 'Groupings';
-        // Sorted for finding things, with the computed everything-group first.
-        const named = groupingNames();
-        const sortedGroups = [
-          ...named.filter((name) => name === ALL_AREAS),
-          ...named.filter((name) => name !== ALL_AREAS).sort((a, b) => a.localeCompare(b)),
-        ];
-        for (const name of sortedGroups) {
-          const option = document.createElement('option');
-          option.value = `grouping:${name}`;
-          option.textContent = name;
-          groups.appendChild(option);
-        }
-        areaDropdown.appendChild(groups);
-
-        const singles = document.createElement('optgroup');
-        singles.label = 'Areas';
-        for (const name of [...allAreas()].sort((a, b) => a.localeCompare(b))) {
-          const option = document.createElement('option');
-          option.value = `area:${name}`;
-          option.textContent = name;
-          singles.appendChild(option);
-        }
-        areaDropdown.appendChild(singles);
-      }
-      const wantedAreas = new Set(query.selections.map((s) => `${s.kind}:${s.name}`));
-      for (const option of areaDropdown.options) option.selected = wantedAreas.has(option.value);
+      const offScreen = query.interfaces.filter((name) => !shownInterfaces.includes(name)).length;
+      interfaceSummary.textContent =
+        `${query.interfaces.length} selected` +
+        (offScreen > 0 ? ` · ${offScreen} not shown by this filter` : '') +
+        ` · ${matching.length} of ${state.interfaces.length} listed`;
 
       // The legend: one row per drawn line, in draw order, so the colour of a
-      // "Case · Area · Metric" line can be read off without hovering it.
+      // "case · interface" line can be read off without hovering it.
       seriesLegend.replaceChildren();
       for (const entry of state.legend) {
         const row = document.createElement('div');
@@ -421,15 +438,8 @@ export function createShell(handlers: ShellHandlers): Shell {
 
       statusText.textContent = state.busy ?? statusSentence(query, state.keptHours);
       memoryReadout.textContent =
-        `${(state.bytes / (1024 * 1024)).toFixed(0)} MB · ` +
+        `${(state.bytes / (1024 * 1024)).toFixed(1)} MB · ` +
         `${state.cases.length} case${state.cases.length === 1 ? '' : 's'}`;
     },
   };
-}
-
-/** Areas a selection resolves to. A grouping is its member areas; the series
- * is built from them and collapsed to one 8,760-point series before any
- * filtering, so every sort stays under 8,760 points (D5). */
-export function areasFor(selection: Selection): string[] {
-  return selection.kind === 'grouping' ? areasIn(selection.name) : [selection.name];
 }

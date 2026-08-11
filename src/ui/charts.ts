@@ -15,7 +15,7 @@ import uPlot from 'uplot';
 import 'uplot/dist/uPlot.min.css';
 import { HOURS_PER_YEAR, MONTH_NAMES } from '../calendar';
 import type { Quantiles, Stats } from '../kernels';
-import { scaleOf, scalesOf } from '../rules';
+import { scaleOf, scalesOf, totalIsMeaningful } from '../rules';
 import type { BoxDim, Query } from '../types';
 
 /** Points on the duration curve's shared x axis. The x axis is % of
@@ -25,28 +25,29 @@ import type { BoxDim, Query } from '../types';
 const DURATION_POINTS = 1000;
 
 export interface CaseSeries {
-  /** "Case · Area · Metric", trimmed to the axes that actually vary. */
+  /** "Case · Interface", trimmed to the axes that actually vary. */
   name: string;
+  /** The full "case · interface", for messages that must be unambiguous even
+   * when the legend label is abbreviated. */
+  detail: string;
   color: string;
-  /** Unit of this line's metric. Lines of different units get different y
-   * scales -- MWh and $/MWh share an axis only by accident, never on purpose. */
+  /** Unit of this line's CASE -- one export file is one quantity for every
+   * interface in it (D13). Lines of different units get different y scales;
+   * MW and $ share an axis only by accident, never on purpose. */
   unit: string;
-  metric: string;
+  /** The case's full quantity, e.g. `Power Flow (MW)`, for the pane header. */
+  quantity: string;
   /** 8,760 values with NaN wherever the hour is filtered out or has no data,
    * or null when the pane refused to build a series at all. */
   values: Float32Array | null;
   /** Shown in place of a chart. Panes refuse rather than plot nonsense. */
   refusal?: string;
   warnings: string[];
-  /** Named in the pane header for a weighted-mean column. */
-  weightColumn?: string;
   /** Kept values, sorted ascending. */
   sorted: Float32Array;
   n: number;
   stats: Stats;
   quantiles: Quantiles;
-  /** Pooled sum(v*w)/sum(w), or null for columns that are not weighted. */
-  pooled: number | null;
   /** Zero in every kept hour of this case -- data, not a load error. */
   allZero: boolean;
 }
@@ -58,9 +59,6 @@ export interface BoxGroup {
 
 export interface ChartsInput {
   query: Query;
-  /** True when any metric is a price/intensive column, which changes both the
-   * header note and the stats table's Average labelling. */
-  weighted: boolean;
   series: CaseSeries[];
   boxes: BoxGroup[];
   /** Case-level notes shown under the case list, e.g. the Feb 29 drop. */
@@ -643,9 +641,9 @@ export function createCharts(onBoxDimChange: (dim: BoxDim) => void): Charts {
       // a zero-width scale, which uPlot cannot range.
       timeExtent = last < first ? null : [first - 0.5, last + 0.5];
       // Units are part of the signature: an axis label and its scale are baked
-      // in at construction, so a metric change from Load (MWh) to a $/MWh
-      // column would otherwise keep the old label and title the chart with
-      // the wrong quantity. Filter changes -- the frequent interaction -- do
+      // in at construction, so switching from a power-flow case to a
+      // congestion-cost one would otherwise keep the old label and title the
+      // chart with the wrong quantity. Filter changes -- the frequent interaction -- do
       // not move this signature, so they still go through setData().
       const scales = scalesOf(drawable);
       const wanted = `${drawable.map((s) => `${s.name}|${s.color}|${s.unit}`).join(',')}`;
@@ -734,19 +732,20 @@ export function createCharts(onBoxDimChange: (dim: BoxDim) => void): Charts {
     }
 
     // ---------------------------------------------------------- headers
-    const weights = Array.from(new Set(drawable.map((s) => s.weightColumn).filter(Boolean)));
-    const note =
-      weights.length > 0
-        ? `weighted mean by ${weights.join(', ')}`
-        : input.weighted
-          ? 'weighted mean'
-          : '';
+    // What is being plotted, named from the files' own title lines. Two
+    // quantities on one chart is legitimate here -- a flow and its congestion
+    // cost, on the two axes -- and the header is what says which is which.
+    const note = Array.from(
+      new Set(drawable.map((s) => s.quantity).filter((quantity) => quantity !== '')),
+    ).join(' · ');
     headerNote(1, note);
     headerNote(2, note);
 
     // An all-zero column plots as a flat line and produces a degenerate box.
-    // That is the data, not a load error, and the pane says so itself.
-    const zeroCases = drawable.filter((s) => s.allZero).map((s) => `${s.name} (${s.metric})`);
+    // That is the data, not a load error, and the pane says so itself. A path
+    // that never binds has zero congestion cost all year, so this fires often
+    // and has to read as information rather than as an error.
+    const zeroCases = drawable.filter((s) => s.allZero).map((s) => s.detail);
     if (zeroCases.length > 0) {
       const text =
         `Zero in every selected hour: ${zeroCases.join(', ')}. ` +
@@ -926,7 +925,7 @@ export function createCharts(onBoxDimChange: (dim: BoxDim) => void): Charts {
 
       context.fillStyle = '#666';
       context.textAlign = 'center';
-      // "case · area · metric" labels are long and there is one per group;
+      // "case · interface" labels are long and there is one per group;
       // unclipped they overprint each other into a grey smear.
       context.fillText(clip(context, group.label, slot - 4), marginLeft + slot * (groupIndex + 0.5), height - 6);
       context.textAlign = 'left';
@@ -951,11 +950,17 @@ export function createCharts(onBoxDimChange: (dim: BoxDim) => void): Charts {
       return;
     }
 
+    // A total is shown only for units whose temporal rule is SUM
+    // (data/quantity-rules.json). MW is a rate: summing it over a filtered
+    // set of hours produces neither MW nor MWh, so the column is absent
+    // rather than filled with a number that would be read as energy.
+    const totals = input.series.some((entry) => totalIsMeaningful(entry.unit));
+
     const table = document.createElement('table');
     table.className = 'stats-table';
     const head = table.createTHead().insertRow();
-    const columns = ['case', 'Average', 'Min', 'Max', 'StdDev'];
-    if (input.weighted) columns.push('Pooled avg');
+    const columns = ['series', 'Average', 'Min', 'Max', 'StdDev', 'Hours'];
+    if (totals) columns.push('Total');
     for (const column of columns) {
       const cell = document.createElement('th');
       cell.textContent = column;
@@ -984,23 +989,28 @@ export function createCharts(onBoxDimChange: (dim: BoxDim) => void): Charts {
       row.insertCell().textContent = formatNumber(entry.stats.min);
       row.insertCell().textContent = formatNumber(entry.stats.max);
       row.insertCell().textContent = formatNumber(entry.stats.sd);
-      if (input.weighted) {
-        row.insertCell().textContent = entry.pooled === null ? '—' : formatNumber(entry.pooled);
+      row.insertCell().textContent = entry.stats.n.toLocaleString();
+      if (totals) {
+        const cell = row.insertCell();
+        const meaningful = totalIsMeaningful(entry.unit);
+        cell.textContent = meaningful ? formatNumber(entry.stats.sum) : '—';
+        if (!meaningful) {
+          cell.title = `${entry.unit || 'This quantity'} is a rate; a total over the kept hours is not a quantity.`;
+        }
       }
     }
     statsBody.appendChild(table);
 
-    // The Average paradox, footnoted next to the numbers themselves rather
-    // than in a help page: both columns are correct and they will disagree
-    // visibly, because high-price hours are high-load hours.
-    if (input.weighted) {
+    // Footnoted next to the numbers themselves rather than in a help page:
+    // every figure here is over the KEPT hours, and a total only exists for
+    // quantities that may be summed over time.
+    if (totals) {
       const footnote = document.createElement('p');
       footnote.className = 'stats-footnote';
       footnote.textContent =
-        'Average is the mean of the plotted per-hour weighted-mean series. Pooled avg is ' +
-        'sum(value × weight) / sum(weight) over the same hours. Both are correct and they ' +
-        'disagree on purpose — the pooled figure is higher because high-price hours are ' +
-        'high-load hours.';
+        'Every figure is over the hours the filters keep, counted in Hours. Total is the sum ' +
+        'over those hours, and is shown only for quantities that may be summed over time — a ' +
+        'rate in MW may not, so its total reads “—”.';
       statsBody.appendChild(footnote);
     }
 

@@ -1,6 +1,6 @@
-# The GridView CSV format
+# The GridView interface CSV format
 
-What a GridView per-area export contains. Every figure here was measured against a real 139 MB export.
+What a GridView monitored-interface export contains. Every figure here was measured against the anonymised sample exports in [`input/`](../input/).
 
 ← [README](../README.md) · related: [glossary](glossary.md) · [csv-parsing](csv-parsing.md) · [footguns](footguns.md)
 
@@ -8,156 +8,110 @@ What a GridView per-area export contains. Every figure here was measured against
 
 ## Shape
 
-One CSV per simulation case. Every case is one full year of hours for every area.
+One CSV per (case, quantity). Every file is one full year of hours, and **one row is one hour** — the area export's `Name` column is gone, because each monitored interface is a column of its own.
 
-| Property | Value |
-|---|---|
-| Bytes | 139,147,178 (~139 MB) |
-| Rows | 376,680 data + 1 header |
-| Row count identity | 43 areas × 8,760 hours |
-| Bytes per row | 364 average (header is 1,028 B) |
-| Columns | **54** = 4 key + 50 numeric |
-| Line endings | **CRLF** throughout, header and data |
-| Row order | **area-fastest** within `(date, hour)` |
-| Hours | 1–24, no gaps, no DST |
-| Decimals | up to **10**, varies per column |
-| Magnitudes | up to 8 digits (`Export Revenue (k$)` max 8.66e7) |
+| Property | Power flow sample | Congestion sample |
+|---|---|---|
+| Bytes | 13,034,046 (12.4 MB) | 6,071,409 (5.8 MB) |
+| Lines | 8,765 = 4 preamble + 1 header + 8,760 data | same |
+| Row count identity | 8,760 hours × 1 row | same |
+| Columns | **170** = 3 key + 167 interfaces | same |
+| Bytes per row | 1,488 average | 693 average |
+| Hours | 1–24, no gaps, no DST | same |
+| Decimals | up to **7** | up to 7 |
+| Magnitudes | max abs 1.15e4 | max abs 7.78e6 |
 
-Because the order is canonical, `Date` / `Hour` / `Name` are pure functions of row index and need not be stored — the cube's indices carry them.
+Because the order is canonical, `Date` and `Hour` are pure functions of row index and need not be stored — the cube's indices carry them.
+
+## The first five lines
+
+```
+Interface Hourly 'Power Flow (MW)' Data for Year 2034
+<blank>
+(From the first hour of 1/1/2034 to the last hour of 12/31/2034. Column identifier -- InterfaceName)
+<blank>
+Date, Hour, TOU,<interface 1>,<interface 2>,…
+```
+
+**The header is line 5.** Four preamble lines above it are fixed by the exporter, so ingest skips exactly four ([`PREAMBLE_LINES`](../src/ingest/header.ts)) rather than scanning for something header-shaped. That is not fussiness: line 1 contains commas, so a tolerant scan happily accepts `Interface Hourly 'Power Flow (MW)' Data for Year 2034` as a three-column header and fails somewhere less obvious later.
+
+Line 1 is the only place the file says **what it measures**. The quoted string is the quantity, its parenthesised tail is the unit, and both are properties of the whole file:
+
+| Title line | Quantity | Unit | Total over hours? |
+|---|---|---|---|
+| `Interface Hourly 'Power Flow (MW)' Data for Year 2034` | Power Flow (MW) | `MW` | no — a rate |
+| `Interface Hourly 'Congestion Cost ($)' Data for Year 2034` | Congestion Cost ($) | `$` | yes |
+
+See [aggregation-semantics.md](aggregation-semantics.md) for what follows from that, and [D13](decisions.md#d13--one-file-is-one-quantity-a-path-is-a-column) for why it is a file property and not a column property.
 
 ## Key columns
 
-Always present, always first four.
+Always present, always first three.
 
 | Column | Values | Notes |
 |---|---|---|
 | `Date` | `M/D/YYYY`, unpadded | Parse as three integers. **Never** construct a `Date` object — see [footgun 3](footguns.md#3-never-let-date-or-timezones-touch-this) |
 | `Hour` | 1–24 | Hour-ending. Fixed 24 per day |
 | `TOU` | `OnPeak` / `OffPeak` | **Read it, never derive it** — see [footgun 17](footguns.md#17-tou-is-data-not-a-formula) |
-| `Name` | area code | Maps to an area index by trimmed name |
 
-### Header quirks
+The header carries stray spaces (` Hour`, ` TOU`). **Trim on ingest, then match by exact canonical name.**
 
-Some names carry leading or trailing spaces — ` Hour`, ` TOU`, ` Name`, ` Total Generation Revenue (k$)`, ` Total Load Payment (k$)`. One is missing a space: `Import Flow(MWh)`. **Trim on ingest, then match by exact canonical name.**
+## The interface columns
 
-## The 50 numeric columns — exact canonical names
+Everything after `TOU` is one monitored interface. There is no fixed list and no canonical schema — the names are the study's, not GridView's, and the samples carry several naming conventions at once:
 
-**Verbatim from the real export header**, after trimming. Reproduce these strings exactly: several carry quirks that a from-memory transcription gets wrong — note `Import Flow(MWh)` and `Simple Average LMP($/MWh)` have **no space before the parenthesis**, while every comparable column does. Match on these names, never on position.
+| Shape | Example from the samples |
+|---|---|
+| Numbered WECC path | `P86 West of John Day E-W` |
+| Path with a prefix word | `Pth 03 Delaney-Palo Verde` |
+| Balancing-authority tie | `W36_SW_AZPS__CA_IID_1` |
+| Named facility | `TransbayCable Pittsburg - Potrero` |
+| Limit companion to a path | `W06_NW_BPAT+__BC_BCHA_Limit` |
 
-Index is the position in *this* file only; it is not stable across exports.
+Names contain spaces, hyphens, plus signs, doubled underscores and parentheses. They do **not** contain commas or quotes in any export seen so far — which is the only reason a comma splitter is sufficient ([csv-parsing.md](csv-parsing.md#known-gaps)).
 
-| # | Column | Kind | Aggregates by |
-|---|---|---|---|
-| 0 | `Avg LMP Weighted by Gen ($/MWh)` | price | weighted mean by `Generation (MWh)` |
-| 1 | `Avg LMP Weighted by Load ($/MWh)` | price | weighted mean by `Load (MWh)` |
-| 2 | `LMP - Energy ($/MWh)` | price | weighted mean by `Load (MWh)` |
-| 3 | `Import Flow(MWh)` | energy | sum |
-| 4 | `Simple Average LMP($/MWh)` | price | **plain** mean (unweighted by definition) |
-| 5 | `Generation (MWh)` | energy | sum |
-| 6 | `Generation Revenue (k$)` | money | sum |
-| 7 | `Served Load Including Losses (MWh)` | energy | sum |
-| 8 | `Load Payment (k$)` | money | sum |
-| 9 | `Unserved Load (MWh)` | energy | sum · 99.18% zero |
-| 10 | `Unserved Load Cost (k$)` | money | sum · 99.18% zero |
-| 11 | `Load (MWh)` | energy | sum · **weight column** |
-| 12 | `Generation Cost (k$)` | money | sum |
-| 13 | `Installed Capacity (MW)` | capacity | sum areas, **mean hours** · 171 distinct |
-| 14 | `Available Capacity (MW)` | capacity | sum areas, **mean hours** |
-| 15 | `Committed Capacity (MW)` | capacity | sum areas, **mean hours** |
-| 16 | `Net Load (MW)` | capacity | sum areas, **mean hours** |
-| 17 | `LMP Loss Component ($/MWh)` | price | weighted mean by `Load (MWh)` |
-| 18 | `LMP Congestion Component ($/MWh)` | price | weighted mean by `Load (MWh)` · bimodal, 58% negative |
-| 19 | `Export Revenue (k$)` | money | sum · max 8.66e7 |
-| 20 | `Spillage (MWh)` | energy | sum · 74.4% zero |
-| 21 | `Import Cost (k$)` | money | sum |
-| 22 | `Export Flow (MWh)` | energy | sum |
-| 23 | `Estimated Losses (MWh)` | energy | sum |
-| 24 | `SO2 Amt` | emissions | sum |
-| 25 | `NOx Amt` | emissions | sum |
-| 26 | `CO2 Amt` | emissions | sum |
-| 27 | `SO2 Cost` | money | sum · **100% zero** |
-| 28 | `NOx Cost` | money | sum · **100% zero** |
-| 29 | `CO2 Cost` | money | sum · 66.7% zero |
-| 30 | `RD A. S. Requirement` | capacity | sum areas, mean hours · **100% zero** |
-| 31 | `LFD A. S. Requirement` | capacity | sum areas, mean hours · **100% zero** |
-| 32 | `RU A. S. Requirement` | capacity | sum areas, mean hours · **100% zero** |
-| 33 | `SR A. S. Requirement` | capacity | sum areas, mean hours · **100% zero** |
-| 34 | `LFU A. S. Requirement` | capacity | sum areas, mean hours · **100% zero** |
-| 35 | `FR A. S. Requirement` | capacity | sum areas, mean hours · **100% zero** |
-| 36 | `RD A. S. Served Amount` | capacity | sum areas, mean hours · **weight column** |
-| 37 | `LFD A. S. Served Amount` | capacity | sum areas, mean hours · **weight column** |
-| 38 | `RU A. S. Served Amount` | capacity | sum areas, mean hours · **weight column** |
-| 39 | `SR A. S. Served Amount` | capacity | sum areas, mean hours · **weight column** |
-| 40 | `LFU A. S. Served Amount` | capacity | sum areas, mean hours · **weight column** |
-| 41 | `FR A. S. Served Amount` | capacity | sum areas, mean hours · **weight column** |
-| 42 | `RD A. S. Price` | price | weighted mean by `RD A. S. Served Amount` |
-| 43 | `LFD A. S. Price` | price | weighted mean by `LFD A. S. Served Amount` |
-| 44 | `RU A. S. Price` | price | weighted mean by `RU A. S. Served Amount` |
-| 45 | `SR A. S. Price` | price | weighted mean by `SR A. S. Served Amount` |
-| 46 | `LFU A. S. Price` | price | weighted mean by `LFU A. S. Served Amount` |
-| 47 | `FR A. S. Price` | price | weighted mean by `FR A. S. Served Amount` |
-| 48 | `Total Generation Revenue (k$)` | money | sum ⚠️ spatial rule unconfirmed |
-| 49 | `Total Load Payment (k$)` | money | sum ⚠️ spatial rule unconfirmed |
+> **Rule: map columns by trimmed header name at ingest. Never by position.** Two runs of the same study monitor different path sets — a path is added, a retired one disappears — and every column after the first difference shifts. A positional parser then plots one path's flows under another path's name, with nothing thrown. See [footgun 18](footguns.md#18-column-order-differs-between-exports).
 
-**Totals: 26 summable · 12 prices (never summed) · 12 capacity (sum areas, mean hours).**
-
-The `Aggregates by` column is a summary. The authoritative rules — including validity of each chart type per column — are [aggregation-semantics.md](aggregation-semantics.md) and the importable [`data/aggregation-rules.json`](../data/aggregation-rules.json).
-
-## Schema drift is real
-
-Columns differ between exports in **both membership and order**.
-
-The real export carries three columns absent from earlier samples — `FR A. S. Requirement`, `FR A. S. Served Amount`, `FR A. S. Price`. They are **interleaved into the A.S. blocks**, one at the end of each block, rather than appended at the end of the file. Every column after the first insertion therefore shifts.
-
-**The concrete failure, verified against both headers:**
-
-| Numeric index 35 | In a 47-column export | In this 50-column export |
-|---|---|---|
-| resolves to | `RD A. S. Served Amount` | `FR A. S. Requirement` |
-| which is | a **weight column** for `RD A. S. Price` | **100% zero** |
-
-A positional parser would silently swap a real weight column for one that is identically zero. Nothing throws — the weighted mean simply divides by a sum of zeros, and the chart renders. This is the worst failure mode available.
-
-> **Rule: map columns by trimmed canonical header name at ingest. Never by position.** See [footgun 18](footguns.md#18-column-order-differs-between-exports).
-
-Handle drift with a union schema plus a per-case presence bitmap. A metric a case never exported is stored as NaN — and NaN silently poisons every kernel, so the bitmap is consulted at query time, not just at ingest ([footgun 21](footguns.md#21-absent-metrics-are-nan-filled-slabs-and-nan-poisons-everything-silently)).
+Handle that with a **union schema** across every dropped file plus a per-file presence bitmap ([D14](decisions.md#d14--the-interface-axis-is-the-union-of-every-dropped-file)). A path a file never monitored is stored as NaN — and NaN silently poisons every kernel, so the bitmap is consulted at query time, not just at ingest ([footgun 21](footguns.md#21-absent-metrics-are-nan-filled-slabs-and-nan-poisons-everything-silently)).
 
 ## Real-data characteristics
 
-Measured on the real export. `degenerate` and `sparse` in the rule table come from this, and the picker's sort order and the panes' banners come from those flags.
+Measured over 1,462,920 cells in each sample. These are what the panes' banners and the picker's ordering exist for.
 
-| Column | Structure |
-|---|---|
-| `SO2 Cost`, `NOx Cost`, all six `A. S. Requirement` | **100% zero** — 8 of 50 columns are identically zero |
-| `Installed Capacity (MW)` | 171 distinct values across 376,680 rows |
-| `Unserved Load` / `Cost` | 99.18% zero |
-| `Spillage (MWh)` | 74.4% zero |
-| `CO2 Cost` | 66.7% zero |
-| `RD`/`LFD`/`LFU`/`FR A. S. Price` | 1,341–3,438 distinct |
-
-**16% of the cube is constant.**
-
-These columns are *valid data, not load errors*, but they plot as flat lines at zero and produce degenerate box plots, so the pane says so itself ([footgun 19](footguns.md#19-eight-columns-are-identically-zero-in-the-real-export)).
+| | Power flow (MW) | Congestion cost ($) |
+|---|---|---|
+| Zero cells | 7.2% | **71.4%** |
+| Negative cells | **42.3%** | 0% |
+| Columns identically zero all year | 11 of 167 | **76 of 167** |
+| Cells in exponent notation | 21,333 (1.5%) | 19,442 (1.3%) |
 
 ### Things that look like corruption but are not
 
-- **Negative values are normal.** LMPs reach −6,015 $/MWh with 24% of hours negative; congestion is bimodal (58% negative); A.S. served amounts carry tiny solver noise (−1e-6). **Do not add clamp-at-zero validation.**
-- **`Import Flow(MWh)` and `Export Flow (MWh)` have identical means** (3169.05) — system-wide flows balance. Useful as an ingest sanity check.
+- **Negative flows are the norm, not an error.** A path runs both ways and the sign is the direction: 42.3% of flow cells are negative. **Do not add clamp-at-zero validation.**
+- **Most congestion columns are zero all year.** A path that never binds costs nothing — 76 of 167 in the sample. A flat line at zero looks like a failed load, so the pane says so itself ([footgun 19](footguns.md#19-eight-columns-are-identically-zero-in-the-real-export)).
+- **Exponent notation is in the data.** `2.568664E-03` and `1.338663E-04` appear for near-zero flows and costs. A digit-loop float parser returns NaN on them and every kernel is designed to skip NaN without complaint, so the loss is silent ([footgun 24](footguns.md#24-exponent-notation-is-in-the-real-exports)).
+
+### Line endings
+
+The area exports this tool grew out of are **CRLF throughout**, header included. The anonymised samples in `input/` are **LF**. The parser strips a trailing `\r` from every field either way and the tests exercise the CRLF path specifically, because `parseFloat("112.4\r")` happens to succeed and a strict inline parser does not ([footgun 16](footguns.md#16-real-gridview-exports-are-crlf)).
 
 ### Time of use
 
-The real rule is **OnPeak = hours ending 6–22, Monday–Saturday**, Sunday fully OffPeak — 60.74% OnPeak. That is *not* the intuitive "weekdays 7–22" (which would give 47.6%). Utilities vary this by tariff and may drop holidays out of OnPeak.
+The rule in the reference study is **OnPeak = hours ending 6–22, Monday–Saturday**, Sunday fully OffPeak. That is *not* the intuitive "weekdays 7–22". Utilities vary this by tariff and may drop holidays out of OnPeak.
 
 **Read the `TOU` column. Never recompute it.** Month, day, day-of-week and season *are* pure functions of the hour index and should be derived arithmetically — TOU is not.
 
 ## Leap years
 
-Cases may be 2034, 2035 or 2044. **February 29 is filtered out at ingest**, so every case is exactly 8,760 hours and all cubes share one shape. The X axis is `(Month, Day, Hour)` rather than a real date, so different years overlay cleanly.
+Cases may fall in a leap year. **February 29 is filtered out at ingest**, so every case is exactly 8,760 hours and all cubes share one shape. The X axis is `(Month, Day, Hour)` rather than a real date, so different years overlay cleanly.
 
-It happens at ingest so the cube is never ragged, and the dropped day is **stated in the case list**, not silent. See [D4](decisions.md#d4--one-year-per-case-feb-29-dropped).
+It happens at ingest so the cube is never ragged, and the dropped day is **stated in the case notes**, not silent. See [D4](decisions.md#d4--one-year-per-case-feb-29-dropped).
 
-## Groupings
+## What is NOT in this format
 
-A `Groupings.csv` maps area → grouping, two columns (`Name`, `Grouping`). In the study this tool was built for, 43 areas resolve into 5 groupings. The file is supplied by the user at runtime and is not part of this repo — the mapping is the analyst's own rollup, not something the build ships.
+Named here because the area export had them and code written against that shape looks for them:
 
-A grouping's series is the **sum of its member areas' series**, computed before context filters — except for price columns, where it is a weighted mean. See [features.md](features.md#groupings) and [D5](decisions.md#d5--grouping--sum-of-member-areas).
+- **No `Name` column, no area axis.** One row is one hour.
+- **No grouping file.** Interfaces are not summed with each other: two paths across the same corridor would double-count, and the sum of two boundary flows is not a flow across any boundary ([D13](decisions.md#d13--one-file-is-one-quantity-a-path-is-a-column)).
+- **No weight columns and no weighted means.** There is no spatial aggregation to weight.
+- **No calculated columns.** Nothing is derived at ingest; every plane is a column the export carried.

@@ -1,43 +1,35 @@
 // src/ui/picker.ts
 //
-// The column picker, shown on the first drop and skippable (D6).
+// The interface picker, shown on the first drop and skippable (D6).
 //
-// Two rules make this more than a checkbox list:
+// Two things make this more than a checkbox list:
 //
-//   * Every column is an independent choice. A weighted-mean column still
-//     NEEDS its weight -- keeping `Avg LMP Weighted by Load ($/MWh)` without
-//     `Load (MWh)` makes every multi-area series for it uncomputable, and the
-//     tempting fallback, a plain mean, is exactly the wrong answer (footgun
-//     20) -- but the answer to that is to say so here and refuse to draw it
-//     later, not to take the checkbox away. A single-area series still plots
-//     without the weight, because one plane IS the series.
-//   * Selection narrows the cube's metric axis itself, not just the parse.
-//     A cube allocated at full canonical width delivers the parse speedup
-//     and none of the memory win, so the live readout below is the real
-//     allocation arithmetic and not an estimate.
+//   * It opens over the UNION of every dropped file's header (D14). Runs
+//     monitor different sets of paths, and a column that is offered by one
+//     file has to be offered for all of them or it can never be selected at
+//     all -- so the list says which files carry a path, and a case that does
+//     not carries it as absent rather than as zero.
+//   * Selection narrows the cube's interface axis itself, not just the parse,
+//     and the readout below is the real allocation arithmetic rather than an
+//     estimate. At this shape memory is not the binding constraint it was for
+//     the area exports -- a full 167-interface year is ~6 MB -- so the default
+//     is everything and the picker's real job is keeping 167 paths out of the
+//     rail when you care about four of them.
 
-import { HOURS_PER_YEAR } from '../calendar';
-import { SLAB_AREAS } from '../ingest/header';
-import {
-  CALCULATED_GROUP,
-  defaultSelection,
-  isDegenerate,
-  metricGroups,
-  requiredInputs,
-  ruleFor,
-} from '../rules';
-
-const BYTES_PER_VALUE = 4; // Float32Array (D1)
+import { cubeBytesFor } from '../ingest/pool';
+import { interfaceGroups } from '../rules';
 
 /**
- * Resolve to the retained column list, or to `union` unchanged if the user
- * skips. A selection missing a weight its own columns depend on is allowed:
- * ingest reports it, and the multi-area series that needs it refuses to draw
- * (footgun 20) rather than silently plain-meaning.
+ * Resolve to the retained interface list, or to `union` unchanged if the user
+ * skips. `coverage` maps interface -> the case names whose header carries it.
  */
-export function showPicker(union: string[], caseCount: number): Promise<string[]> {
+export function showPicker(
+  union: string[],
+  coverage: Map<string, string[]>,
+  caseCount: number,
+): Promise<string[]> {
   return new Promise((resolve) => {
-    const chosen = new Set(defaultSelection(union));
+    const chosen = new Set(union);
 
     const backdrop = document.createElement('div');
     backdrop.className = 'modal-backdrop';
@@ -47,25 +39,31 @@ export function showPicker(union: string[], caseCount: number): Promise<string[]
     backdrop.appendChild(modal);
 
     const title = document.createElement('h2');
-    title.textContent = 'Which metrics should be kept?';
+    title.textContent = 'Which interfaces should be kept?';
     modal.appendChild(title);
 
     const subtitle = document.createElement('p');
     subtitle.className = 'modal-subtitle';
     subtitle.textContent =
-      'A recommended set is ticked — load it as-is, adjust it, or keep everything. ' +
-      'Memory is exactly linear in what you keep, which is how case count stops being ' +
-      'the binding constraint.';
+      caseCount > 1
+        ? `Every path monitored by any of these ${caseCount} files is listed. Keep the lot, or ` +
+          'narrow it now — what you keep here is what the rail offers later.'
+        : 'Every path this export monitors is listed. Keep the lot, or narrow it now — what ' +
+          'you keep here is what the rail offers later.';
     modal.appendChild(subtitle);
 
     const toolbar = document.createElement('div');
     toolbar.className = 'modal-toolbar';
     const filter = document.createElement('input');
     filter.type = 'search';
-    filter.placeholder = 'Filter columns…';
+    filter.placeholder = 'Filter interfaces…';
     filter.className = 'modal-filter';
     toolbar.appendChild(filter);
 
+    // Select all/none act on WHAT THE FILTER SHOWS. With 167 paths the filter
+    // is how a selection gets built -- type "P8", take those, type "Malin",
+    // add those -- and a "Select all" that quietly took the other 150 back
+    // would make that impossible.
     const selectAll = document.createElement('button');
     selectAll.type = 'button';
     selectAll.className = 'btn';
@@ -77,14 +75,6 @@ export function showPicker(union: string[], caseCount: number): Promise<string[]
     selectNone.className = 'btn';
     selectNone.textContent = 'Select none';
     toolbar.appendChild(selectNone);
-
-    // The way back. Without it, "Select none" is a one-way door out of the
-    // default set and the only route back is a page reload.
-    const selectDefault = document.createElement('button');
-    selectDefault.type = 'button';
-    selectDefault.className = 'btn';
-    selectDefault.textContent = 'Recommended';
-    toolbar.appendChild(selectDefault);
     modal.appendChild(toolbar);
 
     const list = document.createElement('div');
@@ -108,67 +98,34 @@ export function showPicker(union: string[], caseCount: number): Promise<string[]
     actions.append(skip, confirm);
     modal.appendChild(actions);
 
-    /** Columns the current selection depends on -- weights and the operands of
-     * calculated columns -- mapped to their dependents. Not enforced; shown, so
-     * dropping one is a decision and not a surprise. */
-    function lockedInputs(): Map<string, { weight: string[]; operand: string[] }> {
-      const locked = new Map<string, { weight: string[]; operand: string[] }>();
-      const at = (input: string) => {
-        const seen = locked.get(input) ?? { weight: [], operand: [] };
-        locked.set(input, seen);
-        return seen;
-      };
-      for (const name of chosen) {
-        const rule = ruleFor(name);
-        if (!rule) continue;
-        for (const weight of [rule.weight, rule.fallbackWeight]) {
-          if (weight) at(weight).weight.push(name);
-        }
-        if (rule.derived) {
-          at(rule.derived.minuend).operand.push(name);
-          at(rule.derived.subtrahend).operand.push(name);
-        }
-      }
-      return locked;
-    }
-
     /** Folders the user has opened or closed, by title. */
     const openState = new Map<string, boolean>();
 
-    /** Which folders are open before the user touches any: the ones an
-     * analyst opens anyway. A UI choice, so it lives here and not with the
-     * classification. */
-    const OPEN_BY_DEFAULT = new Set(['Load', 'Generation', 'Prices', CALCULATED_GROUP]);
-
-    function grouped(needle: string): { title: string; names: string[] }[] {
-      return metricGroups(union.filter((name) => !needle || name.toLowerCase().includes(needle)));
+    function visible(): string[] {
+      const needle = filter.value.trim().toLowerCase();
+      return needle ? union.filter((name) => name.toLowerCase().includes(needle)) : union;
     }
 
     function paint(): void {
-      const locked = lockedInputs();
       const needle = filter.value.trim().toLowerCase();
       list.replaceChildren();
 
-      for (const { title, names } of grouped(needle)) {
+      for (const { title: groupTitle, names } of interfaceGroups(visible(), coverage, caseCount)) {
         const folder = document.createElement('details');
-        folder.dataset.group = title;
-        // Calculated columns are not in any file's header, so the folder is
-        // marked rather than left to look like another block of export data.
-        const calculated = title === CALCULATED_GROUP;
-        if (calculated) folder.className = 'picker-calculated';
+        folder.dataset.group = groupTitle;
         // A filter opens everything -- a hit inside a closed folder is a hit
         // the user cannot see. Otherwise the folder remembers what the user
         // last did to it, which has to survive both a repaint and a filter
         // that hid the folder entirely.
-        folder.open = needle ? true : (openState.get(title) ?? OPEN_BY_DEFAULT.has(title));
+        folder.open = needle ? true : (openState.get(groupTitle) ?? true);
 
         const summary = document.createElement('summary');
         summary.className = 'picker-folder';
         // Recorded on click, not on the toggle event: painting sets `open`
         // programmatically and that fires toggle too.
-        summary.addEventListener('click', () => openState.set(title, !folder.open));
+        summary.addEventListener('click', () => openState.set(groupTitle, !folder.open));
         const label = document.createElement('span');
-        label.textContent = calculated ? `${title} — computed at load, not in the export` : title;
+        label.textContent = groupTitle;
         summary.appendChild(label);
         const count = document.createElement('span');
         count.className = 'picker-count';
@@ -191,25 +148,13 @@ export function showPicker(union: string[], caseCount: number): Promise<string[]
           text.textContent = name;
           row.appendChild(text);
 
-          // Tooltips only; the on-screen badges are gone.
-          const dependents = locked.get(name);
-          const rule = ruleFor(name);
-          if (rule?.derived) {
-            const symbol = rule.derived.op === 'div' ? '\u00f7' : '\u2212';
-            row.title =
-              `Calculated at load: ${rule.derived.minuend} ${symbol} ${rule.derived.subtrahend}. ` +
-              'Keep both of those or this cannot be built.';
-          } else if (dependents && dependents.operand.length > 0) {
-            row.title =
-              `${dependents.operand.join(', ')} is calculated from this. Without it, that ` +
-              'column cannot be built at all.';
-          } else if (dependents && dependents.weight.length > 0) {
-            row.title =
-              `${dependents.weight.join(', ')} uses this as a weight. Without it, those ` +
-              'columns can only be plotted for a single area.';
-          } else if (isDegenerate(name)) {
-            row.title =
-              'Identically zero in every hour of the reference export. Valid data, but a constant.';
+          const carriers = coverage.get(name) ?? [];
+          if (caseCount > 1 && carriers.length < caseCount) {
+            row.title = `Only in ${carriers.join(', ')}. The other file(s) load it as no-data.`;
+            const flag = document.createElement('span');
+            flag.className = 'picker-count';
+            flag.textContent = `${carriers.length}/${caseCount}`;
+            row.appendChild(flag);
           }
 
           box.addEventListener('change', () => {
@@ -222,39 +167,25 @@ export function showPicker(union: string[], caseCount: number): Promise<string[]
         list.appendChild(folder);
       }
 
-      const missing = requiredInputs([...chosen]).filter((weight) => !chosen.has(weight));
-      // Exactly what ingest will allocate: retained x cases x hours x areas x 4.
-      const perMetric = caseCount * HOURS_PER_YEAR * SLAB_AREAS * BYTES_PER_VALUE;
-      const bytes = chosen.size * perMetric;
-      // What the other button costs, so "keep everything" is an informed click
-      // rather than the one number the dialog does not show.
-      skip.title = `All ${union.length} columns ≈ ${(
-        (union.length * perMetric) /
+      // Exactly what ingest will allocate: retained x cases x hours x 4.
+      const bytes = cubeBytesFor(chosen.size) * caseCount;
+      skip.title = `All ${union.length} interfaces ≈ ${(
+        (cubeBytesFor(union.length) * caseCount) /
         (1024 * 1024)
       ).toFixed(0)} MB`;
       readout.textContent =
-        `${chosen.size} metric${chosen.size === 1 ? '' : 's'} × ${caseCount} case` +
-        `${caseCount === 1 ? '' : 's'} ≈ ${(bytes / (1024 * 1024)).toFixed(0)} MB` +
-        (missing.length > 0
-          ? ` · without ${missing.join(', ')}, the columns weighted by ${
-              missing.length === 1 ? 'it' : 'them'
-            } plot for one area only`
-          : '');
+        `${chosen.size} of ${union.length} interface${union.length === 1 ? '' : 's'} × ` +
+        `${caseCount} case${caseCount === 1 ? '' : 's'} ≈ ${(bytes / (1024 * 1024)).toFixed(1)} MB`;
       confirm.disabled = chosen.size === 0;
     }
 
     filter.addEventListener('input', paint);
     selectAll.addEventListener('click', () => {
-      for (const name of union) chosen.add(name);
+      for (const name of visible()) chosen.add(name);
       paint();
     });
     selectNone.addEventListener('click', () => {
-      chosen.clear();
-      paint();
-    });
-    selectDefault.addEventListener('click', () => {
-      chosen.clear();
-      for (const name of defaultSelection(union)) chosen.add(name);
+      for (const name of visible()) chosen.delete(name);
       paint();
     });
 
@@ -263,19 +194,14 @@ export function showPicker(union: string[], caseCount: number): Promise<string[]
       document.removeEventListener('keydown', onKey);
       resolve(result);
     }
-    // Escape takes what is on screen, which is the recommended set until the
-    // user changes it. It used to mean "keep everything", and that reading
-    // stops being safe the moment the default is a subset: dismissing a dialog
-    // should not be the most expensive choice in it.
+    // Escape takes what is on screen, which is everything until the user
+    // changes it: dismissing a dialog should never be the choice that loses
+    // data.
     function onKey(event: KeyboardEvent): void {
       if (event.key === 'Escape' && chosen.size > 0) close([...chosen]);
     }
     document.addEventListener('keydown', onKey);
     skip.addEventListener('click', () => close(union));
-    // Exactly the ticked columns. Adding the weights back here would make the
-    // MB readout above a lie and silence ingest's "not retained" warning --
-    // the whole design is that dropping a weight is a stated decision whose
-    // consequence the pane names later (footgun 20).
     confirm.addEventListener('click', () => close([...chosen]));
 
     paint();

@@ -1,26 +1,21 @@
 // test_loader.mjs
 //
 // Shared setup for the assert-based test scripts, so they import the real
-// src/*.ts modules rather than a reimplementation of them. Two jobs:
+// src/*.ts modules rather than a reimplementation of them.
 //
-//   1. A Node module hook for extensionless relative imports (`./header`),
-//      which are normal TypeScript and normal Vite but which Node's ESM
-//      resolver rejects. Everything else — Node >= 22.6 type stripping,
-//      `with { type: 'json' }` — Node already handles unaided.
+// One job: a Node module hook for extensionless relative imports (`./header`),
+// which are normal TypeScript and normal Vite but which Node's ESM resolver
+// rejects. Everything else — Node >= 22.6 type stripping, `with { type:
+// 'json' }` — Node already handles unaided.
 //
-//   2. Seeding the area axis and the grouping mapping from the SYNTHETIC
-//      fixture in test_fixtures.mjs. NOTHING about a utility's areas ships in
-//      the build (see src/groupings.ts): at runtime the axis is read from the
-//      first CSV loaded and the mapping from a Groupings.csv the user drops. A
-//      test process does neither, so without this every test sees an empty
-//      axis and builds cases with zero areas — which is what silently broke
-//      all three scripts when groupings.ts stopped carrying built-in data.
+// It used to have a second job, seeding an area axis and a grouping mapping
+// into module state before anything else imported them. Neither exists now:
+// an interface is a COLUMN, so a case carries its own axis and no module holds
+// study state that a test has to prime (D13).
 //
 // Usage:  import './test_loader.mjs';   (must come before the src imports)
 
 import { register } from 'node:module';
-
-import { AREAS, groupingsCsv } from './test_fixtures.mjs';
 
 const hooks = `
 import { existsSync } from 'node:fs';
@@ -42,12 +37,3 @@ export async function resolve(specifier, context, nextResolve) {
 `;
 
 register('data:text/javascript,' + encodeURIComponent(hooks), import.meta.url);
-
-// Imported after register() so the hook is in place for groupings.ts's own
-// relative imports.
-const { setAxis, setGroupings } = await import('./src/groupings.ts');
-
-// The axis order is the order ingest reads out of an export's first hour, and
-// the order the cube indexes areas in.
-setAxis(AREAS);
-setGroupings(groupingsCsv());

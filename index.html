@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>GridView Area Plots</title>
+  <title>GridView Interface Plots</title>
   <!-- Inline, so there is no second request and no 404 on every page load.
        Four bars in the ten-case palette's first colour: a duration curve. -->
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23fff'/%3E%3Crect x='2' y='3' width='2' height='10' fill='%231f77b4'/%3E%3Crect x='6' y='6' width='2' height='7' fill='%231f77b4'/%3E%3Crect x='10' y='8' width='2' height='5' fill='%231f77b4'/%3E%3C/svg%3E" />
@@ -14,12 +14,12 @@
     <!-- Topbar -->
     <div id="topbar" class="topbar">
       <div class="topbar-left">
-        <h1 class="app-title">GridView Area Plots</h1>
+        <h1 class="app-title">GridView Interface Plots</h1>
       </div>
       <div class="topbar-center">
         <button id="add-cases-btn" class="btn btn-add">+ Add cases</button>
         <button id="save-btn" class="btn btn-save">Save</button>
-        <button id="load-btn" class="btn btn-load" title="Open a saved .gvap bundle">Load…</button>
+        <button id="load-btn" class="btn btn-load" title="Open a saved .gvip bundle">Load…</button>
       </div>
       <div class="topbar-right">
         <span id="memory-readout" class="memory-readout">0 MB · 0 cases</span>
@@ -37,13 +37,14 @@
       <!-- SERIES Section -->
       <div id="series-section" class="rail-section">
         <h2 class="rail-section-title">SERIES</h2>
-        <div id="metric-select" class="rail-control">
-          <label>Metric <span class="rail-hint">ctrl/shift for several</span></label>
-          <select id="metric-dropdown" multiple size="6"></select>
-        </div>
-        <div id="area-select" class="rail-control">
-          <label>Area/Group <button type="button" id="groupings-btn" class="link-btn" title="Edit which grouping each area belongs to, or load a Groupings.csv">edit…</button></label>
-          <select id="area-dropdown" multiple size="6"></select>
+        <div id="interface-select" class="rail-control">
+          <label>Interface <span class="rail-hint">ctrl/shift for several</span></label>
+          <!-- 167 monitored paths do not fit in a dropdown you scroll. The
+               filter narrows the list; the selection survives it, so a
+               multi-path overlay can be built one search at a time. -->
+          <input id="interface-filter" type="search" class="rail-filter" placeholder="Filter interfaces…" />
+          <select id="interface-dropdown" multiple size="12"></select>
+          <div id="interface-summary" class="rail-hint"></div>
         </div>
         <div id="series-legend" class="series-legend"></div>
       </div>
@@ -105,7 +106,7 @@
               <option value="hourOfDay">hour of day</option>
               <option value="dayOfWeek">day of week</option>
               <option value="season">season</option>
-              <option value="area">area</option>
+              <option value="interface">interface</option>
             </select>
           </label>
           <label class="pane-control"><input type="checkbox" id="box-values-check" /> values</label><span class="pane-icon" title="Expand this pane (or press 3)">⤢</span></div>

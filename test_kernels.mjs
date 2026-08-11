@@ -1,487 +1,270 @@
-// test_kernels.mjs — T5, the aggregation and statistics kernels.
+// test_kernels.mjs — aggregation, statistics and the unit rules.
 //
-// Plain node, assert-based, no test framework (CLAUDE.md hard rule 6).
-// Exits non-zero on any failure.
+// Plain node, assert-based, no test framework. Exits non-zero on any failure.
 //
-// The cases here are chosen to fail loudly on the footguns that otherwise
-// produce plausible numbers:
+// The kernels are small; what they have to get right is not:
 //
-//   * Welford in f64 against a hand-computed dataset, and against one whose
-//     mean is large relative to its spread — the shape where naive f32
-//     `sum(x^2)` measures 58–878% wrong (footgun 11).
-//   * A weighted mean worked out by hand over 3 areas x 2 hours, because
-//     `sum(x*w)/sum(w)` is not any kind of average of the per-area values
-//     (footgun 7).
-//   * `sum(w) == 0` must yield no-data, NOT zero and NOT a plain mean.
-//     The plain mean is precisely the wrong answer (footgun 20).
-//   * A NaN in the input must not silently poison the result (footgun 21).
-//   * Quantiles against a hand-sorted 9-element array.
+//   * A series is one stored plane. There is no aggregation across
+//     interfaces, so the interesting cases are the REFUSALS — a path this
+//     case never monitored, and a path that was monitored but not retained
+//     at load, are different problems and must not read the same.
+//   * NaN is "absent" and must never reach a statistic. It poisons Welford,
+//     defeats every min/max comparison, and sorts to one end of a duration
+//     curve as a cliff of apparent extremes (footgun 21).
+//   * f32 is storage, f64 is arithmetic (footgun 11).
+//   * A total exists only for units that may be summed over time. MW may
+//     not, and the difference is data/quantity-rules.json's business, not a
+//     guess at the call site.
 //
-// Run: node test_kernels.mjs
+// Run:  node test_kernels.mjs
 
 import assert from 'node:assert/strict';
 import './test_loader.mjs';
 
-const {
-  buildSeries,
-  applyMask,
-  stats,
-  quantiles,
-  sortAsc,
-  pooledWeightedMean,
-  createScratch,
-  isAllZero,
-} = await import('./src/kernels.ts');
+const { applyMask, buildSeries, createScratch, hasData, isAllZero, quantiles, sortAsc, stats } =
+  await import('./src/kernels.ts');
 const { HOURS_PER_YEAR } = await import('./src/calendar.ts');
-const { allAreas } = await import('./src/groupings.ts');
-const { ruleFor } = await import('./src/rules.ts');
+const { interfaceGroups, prefixOf, scaleOf, scalesOf, temporalOf, totalIsMeaningful, unitOf } =
+  await import('./src/rules.ts');
 
 const HOURS = HOURS_PER_YEAR;
-const areas = allAreas();
-
 let checks = 0;
 function ok(label) {
   checks++;
   console.log(`ok - ${label}`);
 }
 
-function close(actual, expected, tolerance, label) {
-  assert.ok(
-    Math.abs(actual - expected) <= tolerance,
-    `${label}: expected ${expected}, got ${actual} (tolerance ${tolerance})`,
-  );
-}
-
-/**
- * A CaseData over the first `areaCount` areas and the given metrics.
- * `fill(areaIndex, metricIndex, hour)` returns the value; return NaN to
- * simulate a hole. `absent` lists (area, metric) pairs whose presence bit is
- * 0 — the cube is NaN there, exactly as ingest leaves it.
- */
-function makeCase(metrics, areaCount, fill, absent = []) {
-  const cube = new Float32Array(areas.length * metrics.length * HOURS).fill(NaN);
-  const presence = new Uint8Array(areas.length * metrics.length);
-  const absentSet = new Set(absent.map(([a, m]) => `${a}:${m}`));
-
-  for (let area = 0; area < areaCount; area++) {
-    for (let metric = 0; metric < metrics.length; metric++) {
-      if (absentSet.has(`${area}:${metric}`)) continue;
-      presence[area * metrics.length + metric] = 1;
-      const base = (area * metrics.length + metric) * HOURS;
-      for (let hour = 0; hour < HOURS; hour++) cube[base + hour] = fill(area, metric, hour);
-    }
-  }
+/** A CaseData with `interfaces` planes, filled by `fill(interfaceIndex, hour)`.
+ * `absent` names interfaces whose plane stays NaN with presence 0 — the shape
+ * a file that does not monitor a path produces. */
+function makeCase({
+  name = 'CaseA',
+  interfaces,
+  fill = (i, h) => i * 1000 + h,
+  absent = [],
+  sourceColumns = interfaces,
+  quantity = 'Power Flow (MW)',
+  unit = 'MW',
+  year = 2035,
+} = {}) {
+  const cube = new Float32Array(interfaces.length * HOURS).fill(NaN);
+  const presence = new Uint8Array(interfaces.length);
+  interfaces.forEach((iface, index) => {
+    if (absent.includes(iface)) return;
+    presence[index] = 1;
+    for (let hour = 0; hour < HOURS; hour++) cube[index * HOURS + hour] = fill(index, hour);
+  });
   return {
-    name: 'synthetic',
+    name,
     cube,
-    areas,
-    metrics,
+    interfaces,
     presence,
     tou: new Uint8Array(HOURS),
-    sourceColumns: metrics,
-    year: 2035,
+    sourceColumns,
+    year,
+    quantity,
+    unit,
   };
 }
 
-/** A mask that keeps only `hours`. */
-function maskOf(hours) {
+// ---------------------------------------------------------------- buildSeries
+
+{
+  const data = makeCase({ interfaces: ['P01', 'P02', 'P03'], absent: ['P03'] });
+  const out = createScratch();
+
+  const built = buildSeries(data, 'P02', out);
+  assert.ok(built.values, 'a monitored path builds');
+  assert.equal(built.values[0], 1000, 'the stored plane IS the series');
+  assert.equal(built.values[HOURS - 1], 1000 + HOURS - 1);
+  assert.equal(built.values, out, 'the caller-owned buffer is written, not a fresh one');
+  ok('a retained interface builds straight out of its cube plane');
+
+  assert.equal(hasData(data, 2), false, 'presence says P03 is absent');
+  const missingPlane = buildSeries(data, 'P03', out);
+  assert.equal(missingPlane.values, null, 'an absent plane refuses');
+  assert.match(missingPlane.refusal, /no data/);
+
+  // Monitored but not retained, versus never monitored: different problems,
+  // different fixes, so they must not share a message.
+  const narrow = makeCase({
+    interfaces: ['P01'],
+    sourceColumns: ['P01', 'P02'],
+  });
+  const notRetained = buildSeries(narrow, 'P02', out);
+  assert.equal(notRetained.values, null);
+  assert.match(notRetained.refusal, /was not retained at load/);
+  const neverSeen = buildSeries(narrow, 'P99', out);
+  assert.match(neverSeen.refusal, /does not monitor/);
+  ok('"not retained" and "not monitored" refuse with different messages');
+}
+
+// ---------------------------------------------------------------- applyMask
+
+{
+  const series = createScratch();
   const mask = new Uint8Array(HOURS);
-  for (const hour of hours) mask[hour] = 1;
-  return mask;
-}
-
-// ---------------------------------------------------------------- Welford
-
-{
-  // Textbook set: mean 5, sum of squared deviations 32, sample sd sqrt(32/7).
-  const values = Float32Array.from([2, 4, 4, 4, 5, 5, 7, 9]);
-  const result = stats(values, values.length);
-  assert.equal(result.n, 8);
-  close(result.mean, 5, 1e-12, 'mean');
-  close(result.sd, Math.sqrt(32 / 7), 1e-12, 'sample sd');
-  assert.equal(result.min, 2);
-  assert.equal(result.max, 9);
-  ok('Welford matches a hand-computed mean, sample sd, min and max');
-}
-
-{
-  // The footgun-11 shape: a large mean with a tiny spread. Values are
-  // 100000 + 0..99, whose exact sample variance is n(n+1)/12 = 841.6667.
-  const n = 100;
-  const values = new Float32Array(n);
-  for (let i = 0; i < n; i++) values[i] = 100000 + i;
-  const result = stats(values, n);
-  const expectedSd = Math.sqrt((n * (n + 1)) / 12);
-  close(result.mean, 100049.5, 1e-9, 'mean of a large-mean series');
-  assert.ok(
-    Math.abs(result.sd - expectedSd) / expectedSd < 1e-9,
-    `sd relative error ${Math.abs(result.sd - expectedSd) / expectedSd} must stay under 1e-9`,
-  );
-
-  // What the rejected approach would have produced, computed here in f32 so
-  // the number in footgun 11 is reproducible rather than asserted on faith.
-  let sum = Math.fround(0);
-  let sumSquares = Math.fround(0);
-  for (let i = 0; i < n; i++) {
-    sum = Math.fround(sum + values[i]);
-    sumSquares = Math.fround(sumSquares + Math.fround(values[i] * values[i]));
+  for (let hour = 0; hour < HOURS; hour++) {
+    series[hour] = hour % 5 === 0 ? NaN : hour;
+    mask[hour] = hour % 2 === 0 ? 1 : 0;
   }
-  const naiveVariance = Math.fround(
-    (sumSquares - Math.fround(Math.fround(sum * sum) / n)) / (n - 1),
-  );
-  const naiveError = Math.abs(Math.sqrt(Math.abs(naiveVariance)) - expectedSd) / expectedSd;
-  assert.ok(
-    naiveError > 0.01,
-    `naive f32 sum(x^2) should be visibly wrong here, but was off by only ${naiveError}`,
-  );
-  ok(
-    `Welford sd is exact to <1e-9 relative where naive f32 sum(x^2) is off by ` +
-      `${(naiveError * 100).toFixed(0)}%`,
-  );
+  const gathered = createScratch();
+  const n = applyMask(series, mask, gathered);
+
+  let expected = 0;
+  for (let hour = 0; hour < HOURS; hour += 2) if (hour % 5 !== 0) expected++;
+  assert.equal(n, expected, 'kept hours minus the absent ones');
+  for (let i = 0; i < n; i++) {
+    assert.ok(!Number.isNaN(gathered[i]), 'NaN never reaches the gathered buffer');
+    assert.equal(gathered[i] % 2, 0, 'only masked-in hours are gathered');
+  }
+  ok(`applyMask drops filtered hours and NaN alike (${n.toLocaleString()} kept)`);
 }
 
+// ---------------------------------------------------------------- stats
+
 {
+  const values = new Float32Array([2, 4, 4, 4, 5, 5, 7, 9]);
+  const summary = stats(values, values.length);
+  assert.equal(summary.n, 8);
+  assert.equal(summary.mean, 5);
+  assert.equal(summary.min, 2);
+  assert.equal(summary.max, 9);
+  assert.equal(summary.sum, 40);
+  // Sample (n-1) standard deviation of that textbook set is sqrt(32/7).
+  assert.ok(Math.abs(summary.sd - Math.sqrt(32 / 7)) < 1e-12, `sd was ${summary.sd}`);
+  ok('stats: mean, min, max, total and the (n-1) standard deviation');
+
+  // The shape naive f32 accumulation gets wrong: a large mean and a small
+  // spread. Welford in f64 must land on the f64 reference.
+  const n = 8760;
+  const wide = new Float32Array(n);
+  for (let i = 0; i < n; i++) wide[i] = 1e6 + (i % 7) - 3;
+  const measured = stats(wide, n);
+  let mean = 0;
+  for (let i = 0; i < n; i++) mean += wide[i] / n;
+  let m2 = 0;
+  for (let i = 0; i < n; i++) m2 += (wide[i] - mean) ** 2;
+  const referenceSd = Math.sqrt(m2 / (n - 1));
+  assert.ok(
+    Math.abs(measured.sd - referenceSd) / referenceSd < 1e-9,
+    `sd ${measured.sd} vs reference ${referenceSd}`,
+  );
+  ok('stats: f64 Welford matches an f64 reference on a large-mean, small-spread series');
+
+  // The compensated total, on the shape that loses digits when added naively.
+  const mixed = new Float32Array([1e8, 1, -1e8, 1]);
+  assert.equal(stats(mixed, 4).sum, 2, 'the compensated total keeps the small terms');
+  ok('stats: the total is compensated, so small terms survive a large one');
+
   const empty = stats(new Float32Array(0), 0);
   assert.equal(empty.n, 0);
-  assert.ok(Number.isNaN(empty.mean) && Number.isNaN(empty.sd));
-  const single = stats(Float32Array.from([42]), 1);
-  assert.equal(single.mean, 42);
-  assert.ok(Number.isNaN(single.sd), 'sample sd of one point is undefined, not 0');
-  ok('stats on 0 and 1 points returns NaN rather than a fabricated 0');
-}
-
-// ---------------------------------------------------------------- SUM series
-
-{
-  const metrics = ['Load (MWh)'];
-  assert.equal(ruleFor('Load (MWh)').series, 'SUM');
-  // area a, hour h -> 100*(a+1) + h
-  const data = makeCase(metrics, 3, (area, _metric, hour) => 100 * (area + 1) + hour);
-  const out = createScratch();
-  const series = buildSeries(data, 'Load (MWh)', areas.slice(0, 3), out);
-  assert.equal(series.refusal, undefined);
-  // hour 0: 100 + 200 + 300; hour 5: 105 + 205 + 305
-  assert.equal(series.values[0], 600);
-  assert.equal(series.values[5], 615);
-  ok('SUM adds the member areas hour by hour');
-}
-
-{
-  // One area is present but has a hole. The sum must skip the hole rather
-  // than return NaN for the whole hour, and an hour with nothing at all must
-  // be NaN rather than 0.
-  const metrics = ['Load (MWh)'];
-  const data = makeCase(metrics, 2, (area, _metric, hour) => {
-    if (hour === 0) return NaN; // both areas missing
-    if (hour === 1 && area === 1) return NaN; // one area missing
-    return 10 * (area + 1);
-  });
-  const series = buildSeries(data, 'Load (MWh)', areas.slice(0, 2), createScratch());
-  assert.ok(Number.isNaN(series.values[0]), 'an hour with no data at all must be NaN, not 0');
-  assert.equal(series.values[1], 10, 'a partial hour sums what is there');
-  assert.equal(series.values[2], 30);
-  ok('a NaN in the input neither poisons the hour nor turns no-data into 0');
-}
-
-// ---------------------------------------------------------------- MEAN series
-
-{
-  const metric = 'Simple Average LMP($/MWh)';
-  assert.equal(ruleFor(metric).series, 'MEAN', 'this column is unweighted by definition');
-  const data = makeCase([metric], 3, (area) => [10, 20, 60][area]);
-  const series = buildSeries(data, metric, areas.slice(0, 3), createScratch());
-  assert.equal(series.values[0], 30, '(10 + 20 + 60) / 3');
-  ok('MEAN is the plain unweighted mean of the member areas');
-}
-
-// ---------------------------------------------------------------- WEIGHTED_MEAN
-
-{
-  const price = 'Avg LMP Weighted by Load ($/MWh)';
-  const weight = 'Load (MWh)';
-  const rule = ruleFor(price);
-  assert.equal(rule.series, 'WEIGHTED_MEAN');
-  assert.equal(rule.weight, weight);
-
-  // 3 areas x 2 hours, by hand:
-  //   hour 0  values 10, 20, 30   weights 1, 2, 3
-  //           (10*1 + 20*2 + 30*3) / 6 = 140 / 6 = 23.333...
-  //   hour 1  values 10, 20, 30   weights 0, 0, 0  -> no data
-  const values = [10, 20, 30];
-  const weights = [1, 2, 3];
-  const metrics = [price, weight];
-  const data = makeCase(metrics, 3, (area, metric, hour) => {
-    if (metric === 0) return values[area];
-    return hour === 0 ? weights[area] : 0;
-  });
-
-  const series = buildSeries(data, price, areas.slice(0, 3), createScratch());
-  assert.equal(series.refusal, undefined);
-  assert.equal(series.weightColumn, weight);
-  close(series.values[0], 140 / 6, 1e-5, 'weighted mean');
-
-  // The plain mean would be 20 — close enough to look right, which is the
-  // whole problem.
-  assert.notEqual(Math.fround(series.values[0]), 20);
-
-  assert.ok(
-    Number.isNaN(series.values[1]),
-    'sum(weight) == 0 must be no-data, not 0 and not the plain mean',
-  );
-  assert.ok(
-    series.warnings.some((w) => w.includes('zero')),
-    'zero-weight hours must be reported, not silently dropped',
-  );
-  ok('WEIGHTED_MEAN matches the hand calculation, and sum(w)==0 yields no-data');
-}
-
-{
-  // The weight column was not retained. There is no honest fallback, so the
-  // pane must refuse and name the column to re-ingest (footgun 20).
-  const price = 'Avg LMP Weighted by Load ($/MWh)';
-  const data = makeCase([price], 3, () => 25);
-  const series = buildSeries(data, price, areas.slice(0, 3), createScratch());
-  assert.equal(series.values, null, 'must refuse rather than plain-mean');
-  assert.ok(series.refusal.includes('Load (MWh)'), 'the refusal must name the missing weight');
-  ok('a weighted-mean column with no weight column refuses and names what to re-ingest');
-}
-
-{
-  // Fallback weight: the primary weight is identically zero, so the rule's
-  // declared fallback is used instead.
-  const price = 'RD A. S. Price';
-  const rule = ruleFor(price);
-  assert.equal(rule.weight, 'RD A. S. Served Amount');
-  assert.equal(rule.fallbackWeight, 'RD A. S. Requirement');
-  const metrics = [price, rule.weight, rule.fallbackWeight];
-  const data = makeCase(metrics, 2, (area, metric) => {
-    if (metric === 0) return [4, 8][area]; // price
-    if (metric === 1) return 0; // primary weight: identically zero
-    return [1, 3][area]; // fallback weight
-  });
-  const series = buildSeries(data, price, areas.slice(0, 2), createScratch());
-  assert.equal(series.weightColumn, rule.fallbackWeight);
-  close(series.values[0], (4 * 1 + 8 * 3) / 4, 1e-5, 'fallback-weighted mean');
-  ok('an identically-zero primary weight falls through to the declared fallback weight');
-}
-
-{
-  // A single area needs no aggregation, and must not be turned into NaN by a
-  // zero weight that is irrelevant when there is nothing to combine.
-  const price = 'Avg LMP Weighted by Load ($/MWh)';
-  const metrics = [price, 'Load (MWh)'];
-  const data = makeCase(metrics, 1, (_area, metric) => (metric === 0 ? 33 : 0));
-  const series = buildSeries(data, price, [areas[0]], createScratch());
-  assert.equal(series.values[0], 33, 'one area is its own series');
-  ok('a single-area selection returns the stored plane, zero weight or not');
-}
-
-{
-  // Absent (case, metric): presence 0, cube NaN. Must be refused up front
-  // rather than producing a NaN series that charts as a gap (footgun 21).
-  const metrics = ['Load (MWh)'];
-  const data = makeCase(metrics, 2, () => 5, [
-    [0, 0],
-    [1, 0],
-  ]);
-  const series = buildSeries(data, 'Load (MWh)', areas.slice(0, 2), createScratch());
-  assert.equal(series.values, null);
-  assert.ok(series.refusal.includes('no data'));
-  ok('an absent (case, metric) pair is refused via the presence bitmap, not read as NaN');
-}
-
-{
-  // A retained-but-dropped column must say so differently from one the study
-  // never had — that distinction is the point of carrying sourceColumns.
-  const data = makeCase(['Load (MWh)'], 1, () => 1);
-  data.sourceColumns = ['Load (MWh)', 'CO2 Amt'];
-  const dropped = buildSeries(data, 'CO2 Amt', [areas[0]], createScratch());
-  assert.ok(dropped.refusal.includes('not retained'), dropped.refusal);
-  const never = buildSeries(data, 'SO2 Amt', [areas[0]], createScratch());
-  assert.ok(!never.refusal.includes('not retained'), never.refusal);
-  ok('"dropped at load" and "never in this study" produce different refusals');
-}
-
-// ---------------------------------------------------------------- derived ratios
-//
-// A per-area ratio does not survive a sum: Sum(a/b) != Sum(a)/Sum(b). What
-// makes `Generation / Installed Capacity` right for a grouping is that it is a
-// WEIGHTED_MEAN weighted by its own DENOMINATOR, which reconstitutes the ratio
-// of sums. Both halves of that are checked: the rule table's pairing, and the
-// number the kernel actually produces.
-{
-  const rules = (await import('./data/aggregation-rules.json', { with: { type: 'json' } })).default;
-  const divided = rules.columns.filter((column) => column.derived?.op === 'div');
-  assert.ok(divided.length > 0, 'expected at least one div-derived column to check');
-  for (const column of divided) {
-    assert.equal(
-      column.series,
-      'WEIGHTED_MEAN',
-      `${column.canonical}: a per-area ratio summed or plain-averaged across areas is wrong`,
-    );
-    assert.equal(
-      column.weight,
-      column.derived.subtrahend,
-      `${column.canonical}: the weight must be the denominator, or the collapse is not a ratio of sums`,
-    );
-  }
-  ok(`${divided.length} div-derived column(s) are weighted by their own denominator`);
-
-  // Two areas, deliberately unequal: area 0 is a small plant running flat out,
-  // area 1 a large one barely running. The capacity-weighted answer is
-  // 900/1100, nowhere near the plain mean of 0.9 and 0.05.
-  const RATIO = 'Generation / Installed Capacity';
-  const metrics = [RATIO, 'Installed Capacity (MW)', 'Generation (MWh)'];
-  const capacity = [100, 1000];
-  const generation = [90, 50];
-  const data = makeCase(metrics, 2, (area, metric) =>
-    metric === 0 ? generation[area] / capacity[area] : metric === 1 ? capacity[area] : generation[area],
-  );
-
-  const built = buildSeries(data, RATIO, areas.slice(0, 2), createScratch(), createScratch());
-  assert.equal(built.weightColumn, 'Installed Capacity (MW)');
-  close(built.values[0], 140 / 1100, 1e-6, 'grouping ratio must be Sum(gen)/Sum(capacity)');
-  assert.ok(
-    Math.abs(built.values[0] - (0.9 + 0.05) / 2) > 0.1,
-    'and must not be the plain mean of the per-area ratios',
-  );
-  ok('a derived ratio collapses to Sum(numerator)/Sum(denominator), not the mean of ratios');
-}
-
-{
-  const hazard = ruleFor('Import Flow(MWh)');
-  assert.equal(hazard.intraGroupHazard, true);
-  const data = makeCase(['Import Flow(MWh)'], 2, () => 7);
-  const series = buildSeries(data, 'Import Flow(MWh)', areas.slice(0, 2), createScratch());
-  assert.ok(
-    series.warnings.some((w) => w.includes('double-counts')),
-    'summing a tie flow across both sides double-counts and must say so',
-  );
-  ok('an intra-group hazard column warns when summed across a grouping');
-}
-
-// ---------------------------------------------------------------- mask + gather
-
-{
-  const metrics = ['Load (MWh)'];
-  const data = makeCase(metrics, 1, (_area, _metric, hour) => (hour === 3 ? NaN : hour));
-  const series = buildSeries(data, 'Load (MWh)', [areas[0]], createScratch());
-  const scratch = createScratch();
-  const n = applyMask(series.values, maskOf([1, 3, 5, 7]), scratch);
-  assert.equal(n, 3, 'the NaN hour must be dropped, not gathered');
-  assert.deepEqual(Array.from(scratch.subarray(0, n)), [1, 5, 7]);
-  ok('applyMask gathers only kept hours and drops NaN on the way through');
+  assert.ok(Number.isNaN(empty.mean) && Number.isNaN(empty.sum));
+  const single = stats(new Float32Array([3]), 1);
+  assert.ok(Number.isNaN(single.sd), 'one point has no sample standard deviation');
+  ok('stats: an empty selection is NaN, not 0, and n=1 has no sd');
 }
 
 // ---------------------------------------------------------------- quantiles
 
 {
-  // Hand-sorted: 1..9. n = 9, so p25 sits at index 2 exactly, median at 4,
-  // p75 at 6 — no interpolation needed, which is what makes it checkable.
-  const buffer = createScratch();
-  const source = [7, 2, 9, 4, 1, 8, 3, 6, 5];
-  source.forEach((value, index) => (buffer[index] = value));
-  const q = quantiles(buffer, source.length);
-  assert.equal(q.n, 9);
-  assert.equal(q.min, 1);
-  assert.equal(q.p25, 3);
-  assert.equal(q.median, 5);
-  assert.equal(q.p75, 7);
-  assert.equal(q.max, 9);
-  assert.equal(q.outliers, 0);
+  const values = new Float32Array(101);
+  for (let i = 0; i <= 100; i++) values[i] = i;
+  const q = quantiles(values, 101);
+  assert.equal(q.n, 101);
+  assert.equal(q.min, 0);
+  assert.equal(q.max, 100);
+  assert.equal(q.median, 50);
+  assert.equal(q.p25, 25);
+  assert.equal(q.p75, 75);
+  assert.equal(q.outliers, 0, 'a uniform spread has no Tukey outliers');
   assert.equal(q.degenerate, false);
-  assert.deepEqual(Array.from(buffer.subarray(0, 9)), [1, 2, 3, 4, 5, 6, 7, 8, 9]);
-  ok('quantiles on a hand-sorted 9-element array, and one sort leaves it sorted in place');
+  ok('quantiles: min/p25/median/p75/max on a known uniform spread');
+
+  // One extreme value: the whisker stops at the last point inside the fence
+  // and the extreme is counted as an outlier rather than becoming the whisker.
+  const withOutlier = new Float32Array([...values.slice(0, 101), 10000]);
+  const q2 = quantiles(withOutlier, 102);
+  assert.equal(q2.max, 10000);
+  assert.ok(q2.upperWhisker < 200, `whisker was ${q2.upperWhisker}`);
+  assert.equal(q2.outliers, 1);
+  ok('quantiles: Tukey fences separate the whisker from the extreme');
+
+  // A path that never binds: zero all year. Correct, useless, and it looks
+  // broken, which is why the panes are told about it (footgun 19).
+  const zeros = new Float32Array(500);
+  const q3 = quantiles(zeros, 500);
+  assert.equal(q3.degenerate, true);
+  assert.equal(isAllZero(zeros, 500), true);
+  assert.equal(isAllZero(new Float32Array([0, 0, 1]), 3), false);
+  assert.equal(isAllZero(zeros, 0), false, 'an empty selection is not "all zero"');
+  ok('quantiles: an all-zero column is flagged degenerate, and isAllZero agrees');
+
+  const none = quantiles(new Float32Array(4), 0);
+  assert.ok(Number.isNaN(none.median) && none.n === 0);
+  ok('quantiles: nothing kept reads as NaN, never as 0');
+
+  // Negative flows are ordinary: a path runs both ways.
+  const signed = new Float32Array([-500, -100, 0, 100, 500]);
+  const q4 = quantiles(signed, 5);
+  assert.equal(q4.min, -500);
+  assert.equal(q4.median, 0);
+  assert.deepEqual(Array.from(sortAsc(new Float32Array([3, -1, 2]), 3)), [-1, 2, 3]);
+  ok('quantiles and sortAsc order negative values correctly');
 }
+
+// ---------------------------------------------------------------- unit rules
 
 {
-  // Interpolated case: 1..4, p25 = 1.75, median = 2.5, p75 = 3.25.
-  const buffer = createScratch();
-  [4, 1, 3, 2].forEach((value, index) => (buffer[index] = value));
-  const q = quantiles(buffer, 4);
-  close(q.p25, 1.75, 1e-12, 'p25');
-  close(q.median, 2.5, 1e-12, 'median');
-  close(q.p75, 3.25, 1e-12, 'p75');
-  ok('quantiles interpolate between order statistics when the position is fractional');
+  assert.equal(unitOf('Power Flow (MW)'), 'MW');
+  assert.equal(unitOf('Congestion Cost ($)'), '$');
+  assert.equal(unitOf('Shadow Price ($/MWh)'), '$/MWh');
+  assert.equal(unitOf('Congestion Cost (Total) ($)'), '$', 'the last parenthesis is the unit');
+  assert.equal(unitOf('Interface Utilisation'), '', 'no parentheses, no guessed unit');
+  ok('unitOf reads the unit out of the title-line quantity');
+
+  assert.equal(temporalOf('MW'), 'MEAN');
+  assert.equal(temporalOf('$'), 'SUM');
+  assert.equal(temporalOf('MWh'), 'SUM');
+  assert.equal(temporalOf('$/MWh'), 'MEAN');
+  assert.equal(temporalOf('bananas'), 'MEAN', 'an unknown unit gets a mean, never a total');
+  assert.equal(totalIsMeaningful('MW'), false, 'MW is a rate: no period total');
+  assert.equal(totalIsMeaningful('$'), true);
+  ok('a period total is offered only where summing over hours is meaningful');
+
+  assert.equal(scaleOf('MW'), 'MWh', 'MW and MWh are the same number for one hour');
+  assert.equal(scaleOf('$'), '$');
+  assert.deepEqual(scalesOf([{ unit: 'MW' }, { unit: 'MWh' }, { unit: '$' }]), [
+    { scale: 'MWh', label: 'MW · MWh' },
+    { scale: '$', label: '$' },
+  ]);
+  assert.deepEqual(scalesOf([{ unit: '' }]), [{ scale: '', label: '(no unit)' }]);
+  ok('scalesOf merges MW with MWh and keeps everything else on its own axis');
 }
+
+// ---------------------------------------------------------------- grouping
 
 {
-  // The all-zero / sparse column shape: p25 = median = p75 = 0 and every
-  // real event flagged an outlier. Correct, useless, and looks broken, so it
-  // has to be detectable (footgun 19).
-  const buffer = createScratch();
-  for (let i = 0; i < 100; i++) buffer[i] = 0;
-  buffer[99] = 500;
-  const q = quantiles(buffer, 100);
-  assert.equal(q.p25, 0);
-  assert.equal(q.median, 0);
-  assert.equal(q.p75, 0);
-  assert.equal(q.degenerate, true);
-  assert.equal(q.outliers, 1);
-  assert.equal(q.upperWhisker, 0);
-  assert.equal(q.max, 500);
-  ok('a sparse column reports degenerate quartiles and its one event as an outlier');
+  assert.equal(prefixOf('P84 Harry Allen 500 kV N-S'), 'P84');
+  assert.equal(prefixOf('W36_SW_AZPS__CA_CISO_1'), 'W36');
+  assert.equal(prefixOf('Pth 03 Delaney'), 'Pth 03', 'a numbered word keeps its number');
+  assert.equal(prefixOf('TransbayCable'), 'Tran', 'a single word falls back to four characters');
+
+  const names = ['B path', 'A path', 'C path'];
+  const coverage = new Map([
+    ['A path', ['one', 'two']],
+    ['B path', ['one']],
+    ['C path', ['one', 'two']],
+  ]);
+  assert.deepEqual(interfaceGroups(names, coverage, 2), [
+    { title: 'In every file', names: ['A path', 'C path'] },
+    { title: 'In some files only', names: ['B path'] },
+  ]);
+  assert.deepEqual(interfaceGroups(names, coverage, 1), [
+    { title: 'Interfaces', names: ['A path', 'B path', 'C path'] },
+  ]);
+  assert.deepEqual(interfaceGroups([], coverage, 1), [], 'nothing listed is no groups at all');
+  ok('interfaces are grouped by file coverage, and sorted inside each group');
 }
 
-{
-  const buffer = createScratch();
-  for (let i = 0; i < 8; i++) buffer[i] = 0;
-  assert.equal(isAllZero(buffer, 8), true);
-  buffer[3] = -0.000001; // real solver noise, per docs/data-format.md
-  assert.equal(isAllZero(buffer, 8), false, 'tiny negative noise is data, not zero');
-  assert.equal(isAllZero(buffer, 0), false, 'no data is not "all zero"');
-  ok('isAllZero distinguishes an identically-zero column from one with solver noise');
-}
-
-{
-  const buffer = createScratch();
-  [3, 1, 2].forEach((value, index) => (buffer[index] = value));
-  const view = sortAsc(buffer, 3);
-  assert.equal(view.length, 3, 'sortAsc returns a view of exactly n elements');
-  assert.deepEqual(Array.from(view), [1, 2, 3]);
-  ok('sortAsc sorts in place through the one call site the radix swap would replace');
-}
-
-// ---------------------------------------------------------------- the paradox
-
-{
-  // The pooled weighted average is systematically higher than the mean of the
-  // per-hour weighted-mean series, because the high-price hours are the
-  // high-load hours. Both are correct; they must be labelled, not reconciled.
-  const price = 'Avg LMP Weighted by Load ($/MWh)';
-  const weight = 'Load (MWh)';
-  const metrics = [price, weight];
-  //   hour 0: price 10, load 1     hour 1: price 100, load 99
-  const data = makeCase(metrics, 2, (area, metric, hour) => {
-    if (metric === 0) return hour === 0 ? 10 : 100;
-    return hour === 0 ? 1 : 99;
-  });
-  const series = buildSeries(data, price, areas.slice(0, 2), createScratch());
-  const mask = maskOf([0, 1]);
-
-  const gathered = createScratch();
-  const n = applyMask(series.values, mask, gathered);
-  const plain = stats(gathered, n).mean;
-  const pooled = pooledWeightedMean(series.values, series.weights, mask);
-
-  close(plain, 55, 1e-4, 'mean of the plotted series');
-  close(pooled, (10 * 2 + 100 * 198) / 200, 1e-3, 'pooled weighted average');
-  assert.ok(pooled > plain, 'the pooled average is the higher of the two, and both are correct');
-  ok(
-    `the Average paradox reproduces: plotted-series mean ${plain.toFixed(1)} vs pooled ` +
-      `weighted average ${pooled.toFixed(1)}`,
-  );
-}
-
-{
-  const mask = maskOf([0]);
-  const zeroWeights = new Float32Array(HOURS);
-  const series = new Float32Array(HOURS).fill(5);
-  assert.ok(
-    Number.isNaN(pooledWeightedMean(series, zeroWeights, mask)),
-    'a pooled average over zero total weight is undefined, not 0',
-  );
-  ok('pooledWeightedMean over zero total weight is NaN, not 0');
-}
-
-console.log(`\n${checks} checks passed`);
+console.log(`\n${checks} checks passed.`);
