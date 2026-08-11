@@ -1,10 +1,9 @@
 // src/calendar.ts
 //
 // The global 8,760-hour calendar: one packed Uint32Array built once per
-// year and memoized. Every field is index arithmetic, never a Date object
-// (docs/footguns.md #3 -- one `new Date(str)` shifts rows by a day in half
-// the world's timezones). Hours are the fixed 24 hours of a non-leap year;
-// Feb 29 does not exist here, it is dropped at ingest (D4).
+// year and memoized. Every field is index arithmetic, never a Date object:
+// timezone parsing shifts rows by a day in half the world. Hours are the
+// fixed 24 hours of a non-leap year; Feb 29 is dropped at ingest.
 //
 // Bit layout of one packed entry (LSB first):
 //   month      bits  0- 3  (4 bits)  1-12
@@ -56,10 +55,9 @@ export const DAY_NAMES = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'] as co
 
 /**
  * TOU categories, indexed by the code stored in CaseData.tou. Only two
- * categories -- docs/footguns.md #17: TOU is read from the file and never
- * recomputed; utilities vary the OnPeak window but the file only ever
- * distinguishes OnPeak/OffPeak. Ingest (T3) must encode the file's TOU
- * column into these codes (0 = OffPeak, 1 = OnPeak).
+ * categories. TOU is read from the file and never recomputed; utilities vary
+ * the OnPeak window but the file only ever distinguishes OnPeak/OffPeak.
+ * Ingest must encode the file's TOU column into these codes.
  */
 export const TOU_LABELS = ['OffPeak', 'OnPeak'] as const;
 

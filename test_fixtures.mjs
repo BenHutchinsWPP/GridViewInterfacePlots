@@ -8,8 +8,7 @@
 // the ingest tests actually gate on, because a fixture that quietly loses one
 // turns a real parser bug into a passing run:
 //
-//   * The four preamble lines and a header on line 5, which is the whole
-//     difference in shape from the area exports (docs/data-format.md).
+//   * The four preamble lines and a header on line 5.
 //   * A title line naming a quoted quantity and a year — the file's unit and
 //     its aggregation rule are read from there and nowhere else.
 //   * CRLF throughout, so the last-column trailing-\r trap is exercised

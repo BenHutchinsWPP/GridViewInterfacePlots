@@ -1,6 +1,6 @@
 // The WASM CSV parser for GridView MONITORED-INTERFACE exports.
 //
-// Shape of the input (docs/data-format.md):
+// Shape of the input:
 //
 //   line 1   Interface Hourly 'Power Flow (MW)' Data for Year 2034
 //   line 2   (blank)
@@ -13,17 +13,16 @@
 // module only ever sees whole DATA rows. Two invariants carry over from the
 // area-export parser this replaced, and one is new:
 //
-// 1. MEMORY (footgun 22). Every Worker needs its own WASM instance (linear
-//    memory cannot be shared without SharedArrayBuffer, which D2 forbids on
-//    GitHub Pages), so per-instance memory must be a function of BLOCK size,
-//    never of case size: 12 MiB input window + an 8 MiB slab.
-// 2. BLOCK INDEPENDENCE (D10). Each row's hour comes from its OWN Date and
+// 1. MEMORY. Every Worker needs its own WASM instance, so per-instance memory
+//    must be a function of BLOCK size, never of case size: 12 MiB input
+//    window + an 8 MiB slab.
+// 2. BLOCK INDEPENDENCE. Each row's hour comes from its OWN Date and
 //    Hour fields, never from a running row counter, so a worker needs its
 //    bytes and not its position and blocks may be parsed in any order.
-// 3. ONE ROW = ONE HOUR (D13). The area column is gone: every interface is a
-//    COLUMN, so a row is a complete hour and no hour is ever split across two
-//    blocks. The slab is [NUM interfaces x MAX_BLOCK_HOURS] and the blit on
-//    the JS side is a straight copy rather than an edge-aware merge.
+// 3. ONE ROW = ONE HOUR. Every interface is a column, so a row is a complete
+//    hour and no hour is ever split across two blocks. The slab is
+//    [NUM interfaces x MAX_BLOCK_HOURS] and the JS-side blit is a straight
+//    copy rather than an edge-aware merge.
 //
 // Build: ./build.sh
 
@@ -67,14 +66,14 @@ __attribute__((export_name("last_out_of_range"))) unsigned   last_out_of_range(v
 // Fields past the slab's NUM columns, and rows whose Date/Hour did not
 // resolve to an hour of the year. Both are silent data loss if unreported,
 // which is the one failure mode this project cannot see by eye. Feb 29 is
-// counted apart from them because dropping it is intended (D4) and stated,
-// not a fault.
+// counted apart from them because dropping it is intended and stated, not a
+// fault.
 __attribute__((export_name("last_wide_field"))) unsigned     last_wide_field(void){ return g_wideField; }
 __attribute__((export_name("last_bad_row")))    unsigned     last_bad_row(void)  { return g_badRow; }
 __attribute__((export_name("last_feb29")))      unsigned     last_feb29(void)    { return g_feb29; }
 
 // Cumulative days before each month, non-leap. Feb 29 is dropped at ingest
-// (D4), so a leap year uses the same table and the Feb 29 rows are skipped.
+// so a leap year uses the same table and the Feb 29 rows are skipped.
 static const unsigned short CUM[12] = {0,31,59,90,120,151,181,212,243,273,304,334};
 
 // f64 digit accumulation -- measured FASTER than the Eisel-Lemire u64-mantissa
@@ -101,7 +100,7 @@ static inline float parse_float(const unsigned char* p, const unsigned char* e) 
   //     costs 20% throughput (204 -> 160 MiB/s) and changes none of the
   //     differing cells -- those values carry 18 significant digits, so the
   //     mantissa is inexact either way.
-  //   * Eisel-Lemire is already refuted for wasm32 in csv-parsing.md.
+  //   * Eisel-Lemire is already refuted for wasm32 here.
   // The residual is below f32 storage precision by construction, which is
   // the only reason it is acceptable. T4 gates it at <= 1 ulp, not at zero.
   double ip = 0.0;
