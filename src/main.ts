@@ -75,6 +75,10 @@ const buffers = new Map<string, CaseBuffers>();
  * so one buffer covers the whole pane no matter how many boxes it draws. */
 const boxScratch = createScratch();
 let notes: string[] = [];
+/** The "only the first case is shown" hint from a drop too wide to draw. Kept
+ * apart from `notes` because it is true only until the user picks for
+ * themselves, and a hint that outlives its own condition is misinformation. */
+let caseHint: string | null = null;
 let busy: string | null = null;
 
 let query: Query = Object.freeze({
@@ -289,6 +293,9 @@ function render(): void {
   const keys = seriesKeys(active);
 
   const series: CaseSeries[] = [];
+  /** Case name -> the colour of its first drawn line, for the rail's swatch.
+   * Empty when nothing is drawn (no selection, or past the colour cap). */
+  const caseColors = new Map<string, string>();
   let keptHours = 0;
 
   // Ten colours, ten lines: the mapping has to be learnable. The cross
@@ -300,6 +307,7 @@ function render(): void {
     if (overflow) return;
     const { data, interfaceName } = key;
     const color = CASE_COLORS[index % CASE_COLORS.length];
+    if (!caseColors.has(data.name)) caseColors.set(data.name, color);
     const buffer = buffersFor(key);
 
     buildMask(query.filters, buildCalendar(data.year), data.tou, buffer.mask);
@@ -358,7 +366,11 @@ function render(): void {
     });
   });
 
-  const paneNotes = [...notes, ...series.flatMap((entry) => entry.warnings)];
+  const paneNotes = [
+    ...notes,
+    ...(caseHint ? [caseHint] : []),
+    ...series.flatMap((entry) => entry.warnings),
+  ];
   if (overflow) {
     paneNotes.unshift(
       `${keys.length} series selected (${active.length} case(s) × ${query.interfaces.length} ` +
@@ -380,6 +392,7 @@ function render(): void {
     enabled,
     interfaces: available,
     coverage: coverageOfCases(),
+    colors: caseColors,
     legend: series.map((entry) => ({ label: entry.name, color: entry.color })),
     keptHours: active.length === 0 ? HOURS_PER_YEAR : keptHours,
     bytes: cases.reduce((total, data) => total + data.cube.byteLength, 0),
@@ -481,8 +494,30 @@ async function loadFiles(files: File[]): Promise<void> {
   }
 }
 
+/**
+ * Adopt the loaded cases as the selection.
+ *
+ * A drop can carry more cases than there are colours, and the panes refuse to
+ * draw past that cap rather than plot ten indistinguishable lines -- so
+ * selecting all of them lands on the refusal, which reads as "the drop did
+ * nothing". A drop that cannot fit therefore selects its first case and
+ * leaves the rest to the rail, and says so.
+ */
 function setQueryCases(): void {
-  setQuery({ cases: cases.map((data) => data.name) });
+  const names = cases.map((data) => data.name);
+  // Lines are cases x interfaces; the interface axis is at least one path
+  // wide once render() has adopted one (it may still be empty on first drop).
+  const perCase = Math.max(query.interfaces.length, 1);
+  if (names.length * perCase <= CASE_COLORS.length) {
+    caseHint = null;
+    setQuery({ cases: names });
+    return;
+  }
+  caseHint =
+    `${names.length} cases loaded — more than the ${CASE_COLORS.length} lines that can be told ` +
+    `apart by colour, so only ${names[0]} is shown. Click another case in the rail to switch, ` +
+    'or ctrl/shift-click to compare several.';
+  setQuery({ cases: names.slice(0, 1) });
 }
 
 async function saveAll(): Promise<void> {
@@ -527,13 +562,18 @@ async function restoreBundleFile(file: File): Promise<void> {
 const shell = createShell({
   onQueryChange: setQuery,
   onFiltersChange: setFilters,
-  onToggleCase(name) {
-    const next = new Set(query.cases);
-    if (next.has(name)) next.delete(name);
-    else next.add(name);
-    setQuery({ cases: cases.map((d) => d.name).filter((n) => next.has(n)) });
+  onSelectCases(names) {
+    // The user has now chosen for themselves; the drop's hint has said its
+    // piece and would only be wrong from here.
+    caseHint = null;
+    // Load order, not click order: the colour a case draws in comes from its
+    // position, so a selection built by shift-clicking upwards has to end up
+    // in the same order as one built downwards.
+    const wanted = new Set(names);
+    setQuery({ cases: cases.map((d) => d.name).filter((n) => wanted.has(n)) });
   },
   onRemoveCase(name) {
+    caseHint = null;
     const index = cases.findIndex((data) => data.name === name);
     if (index >= 0) cases.splice(index, 1);
     // Buffer keys are `case\0interface`, so the case name alone is never a

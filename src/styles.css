@@ -417,6 +417,9 @@ body {
   font-weight: 400;
   font-size: 10px;
   color: var(--color-text-secondary);
+  /* Section titles are uppercased; the hint inside one is prose. */
+  text-transform: none;
+  letter-spacing: normal;
 }
 
 /* The interface list is long enough to need a search of its own. */
@@ -458,6 +461,13 @@ body {
   border-radius: 2px;
   flex-shrink: 0;
   display: inline-block;
+}
+
+/* A case that is not drawn holds no colour: hollow, so the swatch never
+ * promises a colour the line will not have once the case is selected. */
+.case-swatch-off {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--color-border);
 }
 
 .case-name {

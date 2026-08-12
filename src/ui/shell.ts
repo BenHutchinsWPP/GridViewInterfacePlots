@@ -35,6 +35,10 @@ export interface ShellState {
   /** Interface -> the case names that carry it, for the rail's "in 1 of 2
    * files" hint. */
   coverage: Map<string, string[]>;
+  /** Case name -> the colour its first drawn line actually got. Absent for a
+   * case that is not drawn: colours are handed out over the SELECTED cases,
+   * so a case's swatch cannot be read off its position in this list. */
+  colors: Map<string, string>;
   /** One row per drawn line: the cross product is no longer readable from the
    * case list alone, so the legend names every line it produced. */
   legend: { label: string; color: string }[];
@@ -48,7 +52,9 @@ export interface ShellState {
 export interface ShellHandlers {
   onQueryChange(patch: Partial<Query>): void;
   onFiltersChange(patch: Partial<Filters>): void;
-  onToggleCase(name: string): void;
+  /** The next case selection, in rail order. Replaces the whole selection --
+   * the cases list is a listbox, not a row of independent toggles. */
+  onSelectCases(names: string[]): void;
   onRemoveCase(name: string): void;
   onFiles(files: File[]): void;
   onAddCases(): void;
@@ -227,14 +233,54 @@ export function createShell(handlers: ShellHandlers): Shell {
     handlers.onQueryChange({});
   });
 
+  /** The case names in rendered order, for shift-range selection. */
+  let shownCases: string[] = [];
+  /** The last rendered query's case list. */
+  let currentCases: string[] = [];
+  /** The last plainly clicked row, the anchor a shift-click ranges from. */
+  let caseAnchor: number | null = null;
+
+  // Cases select the way the interface list above them does, because a drop
+  // of twenty files with every case on draws past the colour cap and the
+  // panes refuse rather than plot -- which reads as "the drop did nothing".
+  // So: plain click takes ONE case, ctrl/cmd-click toggles one in or out, and
+  // shift-click takes the range from the last plain click. Same gestures as a
+  // <select multiple>, and the same as the filter chips.
   casesList.addEventListener('click', (event) => {
     const target = event.target as HTMLElement;
     const item = target.closest<HTMLElement>('.case-item');
     if (!item) return;
     const name = item.dataset.case;
     if (!name) return;
-    if (target.classList.contains('case-remove')) handlers.onRemoveCase(name);
-    else handlers.onToggleCase(name);
+    if (target.classList.contains('case-remove')) {
+      handlers.onRemoveCase(name);
+      return;
+    }
+
+    const index = shownCases.indexOf(name);
+    const additive = event.ctrlKey || event.metaKey;
+
+    if (event.shiftKey && caseAnchor !== null && index >= 0) {
+      // Ctrl keeps what is already selected; plain shift replaces it.
+      const next = additive ? new Set(currentCases) : new Set<string>();
+      const lo = Math.min(caseAnchor, index);
+      const hi = Math.max(caseAnchor, index);
+      for (let i = lo; i <= hi; i++) next.add(shownCases[i]);
+      handlers.onSelectCases(shownCases.filter((entry) => next.has(entry)));
+      return;
+    }
+
+    caseAnchor = index >= 0 ? index : null;
+
+    if (additive) {
+      const next = new Set(currentCases);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      handlers.onSelectCases(shownCases.filter((entry) => next.has(entry)));
+      return;
+    }
+
+    handlers.onSelectCases([name]);
   });
 
   // ------------------------------------------------------------ focus mode
@@ -331,20 +377,27 @@ export function createShell(handlers: ShellHandlers): Shell {
       // and is named next to it: two cases of different quantities overlay on
       // two axes and the case list is where that is explained.
       casesList.replaceChildren();
+      shownCases = state.cases.map((data) => data.name);
+      currentCases = [...query.cases];
+      if (caseAnchor !== null && caseAnchor >= shownCases.length) caseAnchor = null;
       if (state.cases.length === 0) {
         const empty = document.createElement('div');
         empty.className = 'case-empty';
         empty.textContent = 'Drop CSV exports anywhere on this window.';
         casesList.appendChild(empty);
       }
-      state.cases.forEach((data, index) => {
+      state.cases.forEach((data) => {
         const item = document.createElement('div');
         item.className = 'case-item' + (state.enabled.has(data.name) ? ' case-on' : '');
         item.dataset.case = data.name;
 
         const swatch = document.createElement('span');
-        swatch.className = 'case-swatch';
-        swatch.style.background = CASE_COLORS[index % CASE_COLORS.length];
+        // A case that draws nothing has no colour to claim -- an unselected
+        // row showing a palette colour it will not get once selected is a
+        // legend that lies.
+        const color = state.colors.get(data.name);
+        swatch.className = 'case-swatch' + (color ? '' : ' case-swatch-off');
+        if (color) swatch.style.background = color;
         item.appendChild(swatch);
 
         const label = document.createElement('span');
