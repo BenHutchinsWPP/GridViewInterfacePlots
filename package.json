@@ -1,0 +1,22 @@
+{
+  "name": "gridview-interface-plots",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "sync-wasm": "node scripts/sync-wasm.mjs",
+    "predev": "node scripts/sync-wasm.mjs",
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "prebuild": "node scripts/sync-wasm.mjs",
+    "pretest": "node scripts/sync-wasm.mjs",
+    "test": "tsc --noEmit && node test_calendar.mjs && node test_kernels.mjs && node test_ingest.mjs && node test_samples.mjs && node test_assets.mjs"
+  },
+  "dependencies": {
+    "uplot": "^1.6.32"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.2",
+    "vite": "^5.4.0"
+  }
+}

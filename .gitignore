@@ -1,0 +1,35 @@
+# ── REAL UTILITY DATA — NEVER COMMIT ────────────────────────────────
+# "the results must remain private. NO LEAKING THE DATA."
+# This repo has a public-facing GitHub remote and is destined for GitHub Pages.
+# Verify before every commit:  git check-ignore -v testcasefull.csv
+testcasefull.csv
+*full.csv
+/real/
+**/real-data/
+/tmp-data/
+
+# Real exports stay local. The tracked exception is input/*.csv, which are
+# ANONYMISED samples committed on purpose and used by test_samples.mjs; the
+# unit tests otherwise build their own synthetic export in test_fixtures.mjs.
+# A real study export dropped anywhere else shows up in `git status` and the
+# check above is what catches it.
+testcase.csv
+Groupings.csv
+
+# ── ARCHIVED EXPLORATION — untracked by design ──────────────────────
+# The feasibility spike: benchmark harnesses, generators, raw result JSON,
+# and the two superseded planning docs (orchestrate.md, spec.md).
+# Everything worth keeping was distilled into docs/. See docs/benchmarks.md.
+/archive/
+
+# Build artifacts
+node_modules/
+dist/
+.vite/
+.DS_Store
+
+# parser/block.wasm is NOT ignored: D9 requires either a CI build step or a
+# committed binary, and a Pages deploy without it fails at compileStreaming.
+# public/block.wasm is the prebuild copy of that same file — generated, so
+# ignored.
+public/block.wasm
