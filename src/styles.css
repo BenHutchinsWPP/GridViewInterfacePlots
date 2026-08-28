@@ -396,6 +396,7 @@ body {
 }
 
 #month-chips { grid-template-columns: repeat(6, 1fr); }
+#day-of-month-chips { grid-template-columns: repeat(8, 1fr); }
 #hour-chips { grid-template-columns: repeat(12, 1fr); }
 #day-chips { grid-template-columns: repeat(7, 1fr); }
 #season-chips { grid-template-columns: repeat(4, 1fr); }

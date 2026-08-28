@@ -118,6 +118,10 @@ export function statusSentence(query: Query, keptHours: number): string {
     summarise(filters.months, months, (m) => MONTH_NAMES[m - 1], 'all months'),
     summarise(filters.daysOfWeek, days, (d) => DAY_NAMES[d], 'all days'),
   ];
+  if (filters.daysOfMonth !== null) {
+    const daysOfMonth = Array.from({ length: 31 }, (_, i) => i + 1);
+    parts.push(`day ${summarise(filters.daysOfMonth, daysOfMonth, String, 'all')}`);
+  }
   if (filters.hoursOfDay !== null) {
     parts.push(`HE ${summarise(filters.hoursOfDay, hours, String, 'all')}`);
   }
@@ -157,6 +161,13 @@ export function createShell(handlers: ShellHandlers): Shell {
     MONTH_NAMES.map((label, index) => ({ value: index + 1, label })),
     (next) => handlers.onFiltersChange({ months: next }),
   );
+  // 31 chips whatever the month: a chip for the 31st simply keeps fewer hours
+  // once shorter months are in play, the same way a month chip does.
+  const dayOfMonthChips = createChipGrid(
+    byId('day-of-month-chips'),
+    Array.from({ length: 31 }, (_, i) => ({ value: i + 1, label: String(i + 1) })),
+    (next) => handlers.onFiltersChange({ daysOfMonth: next }),
+  );
   const hourChips = createChipGrid(
     byId('hour-chips'),
     Array.from({ length: 24 }, (_, i) => ({ value: i + 1, label: String(i + 1) })),
@@ -181,6 +192,7 @@ export function createShell(handlers: ShellHandlers): Shell {
   function resetFilters(): void {
     handlers.onFiltersChange({
       months: null,
+      daysOfMonth: null,
       hoursOfDay: null,
       daysOfWeek: null,
       seasons: null,
@@ -532,6 +544,7 @@ export function createShell(handlers: ShellHandlers): Shell {
 
       // FILTERS
       monthChips.render(query.filters.months);
+      dayOfMonthChips.render(query.filters.daysOfMonth);
       hourChips.render(query.filters.hoursOfDay);
       dayChips.render(query.filters.daysOfWeek);
       seasonChips.render(query.filters.seasons);

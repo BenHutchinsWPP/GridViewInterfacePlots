@@ -12,6 +12,7 @@
  */
 export interface Filters {
   readonly months: Set<number> | null; // 1-12
+  readonly daysOfMonth: Set<number> | null; // 1-31
   readonly hoursOfDay: Set<number> | null; // 1-24, hour-ending (HE)
   readonly daysOfWeek: Set<number> | null; // 0-6, 0 = Monday .. 6 = Sunday
   readonly seasons: Set<string> | null; // 'Winter' | 'Spring' | 'Summer' | 'Fall'

@@ -40,6 +40,7 @@ function ok(label) {
 
 const NO_FILTERS = {
   months: null,
+  daysOfMonth: null,
   hoursOfDay: null,
   daysOfWeek: null,
   seasons: null,
@@ -129,6 +130,14 @@ const NO_FILTERS = {
   const january = buildMask({ ...NO_FILTERS, months: new Set([1]) }, calendar, tou);
   assert.equal(count(january), 31 * 24);
 
+  const firsts = buildMask({ ...NO_FILTERS, daysOfMonth: new Set([1]) }, calendar, tou);
+  assert.equal(count(firsts), 12 * 24, 'the 1st of every month');
+
+  const thirtyFirsts = buildMask({ ...NO_FILTERS, daysOfMonth: new Set([31]) }, calendar, tou);
+  // Only the seven 31-day months have one, so a high day is not an error --
+  // it just keeps fewer hours.
+  assert.equal(count(thirtyFirsts), 7 * 24, 'only the 31-day months have a 31st');
+
   const he17 = buildMask({ ...NO_FILTERS, hoursOfDay: new Set([17]) }, calendar, tou);
   assert.equal(count(he17), 365, 'one hour-ending a day, all year');
 
@@ -148,6 +157,7 @@ const NO_FILTERS = {
   const narrow = buildMask(
     {
       months: new Set([7]),
+      daysOfMonth: new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
       hoursOfDay: new Set([17, 18]),
       daysOfWeek: new Set([0, 1, 2, 3, 4]),
       seasons: new Set(['Summer']),
@@ -162,6 +172,7 @@ const NO_FILTERS = {
     const he = getHourOfDay(entry);
     if (
       getMonth(entry) === 7 &&
+      getDayOfMonth(entry) <= 10 &&
       (he === 17 || he === 18) &&
       getDayOfWeek(entry) <= 4 &&
       SEASON_NAMES[getSeason(entry)] === 'Summer' &&
@@ -172,7 +183,7 @@ const NO_FILTERS = {
   }
   assert.equal(count(narrow), expected);
   assert.ok(expected > 0, 'the combined filter must keep something to be a test');
-  ok(`combined filters intersect (${expected} hours kept by all five)`);
+  ok(`combined filters intersect (${expected} hours kept by all six)`);
 
   // TOU is read, never recomputed (footgun 17). This bitmap follows no rule a
   // calendar could produce, and the mask must follow it exactly.

@@ -89,6 +89,7 @@ let query: Query = Object.freeze({
   interfaces: [] as readonly string[],
   filters: Object.freeze({
     months: null,
+    daysOfMonth: null,
     hoursOfDay: null,
     daysOfWeek: null,
     seasons: null,
